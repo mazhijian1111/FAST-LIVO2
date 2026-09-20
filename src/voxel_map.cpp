@@ -52,6 +52,50 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("local_map/sliding_thresh", voxel_config.sliding_thresh, 8);
 }
 
+// ---- DD-ESIKF (Project A) param loading ----------------------------------
+void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
+{
+  nh.param<bool>  ("dd_esikf/enable",            dd_enable_,                false);
+  nh.param<double>("dd_esikf/tau_abs",           dd_cfg_.tau_abs,           1.0);
+  nh.param<double>("dd_esikf/tau_rel",           dd_cfg_.tau_rel,           1e-3);
+  nh.param<bool>  ("dd_esikf/hard_mask",        dd_cfg_.hard_mask,         false);
+  nh.param<double>("dd_esikf/default_prior_info", dd_cfg_.default_prior_info, 0.0);
+  nh.param<bool>  ("dd_esikf/per_frame_mask",   dd_cfg_.per_frame_mask,   true);
+  // Layer 2 (Theorem T2): NIS-based adaptive LiDAR measurement noise.
+  nh.param<bool>  ("dd_esikf/adaptive_enable",  dd_ada_cfg_.enable,        false);
+  nh.param<double>("dd_esikf/adaptive_alpha",   dd_ada_cfg_.alpha,         0.05);
+  nh.param<double>("dd_esikf/adaptive_phi_min", dd_ada_cfg_.phi_min,       1.0);
+  nh.param<double>("dd_esikf/adaptive_phi_max", dd_ada_cfg_.phi_max,       20.0);
+  nh.param<double>("dd_esikf/adaptive_ramp_thr", dd_ada_cfg_.ramp_thr,     1.5);
+  // Layer 6 (Theorem T6): range-dependent anisotropic LiDAR R.
+  nh.param<bool>  ("dd_esikf/aniso_enable",   dd_aniso_cfg_.enable,      false);
+  nh.param<double>("dd_esikf/aniso_far_range", dd_aniso_cfg_.far_range,   30.0);
+  nh.param<double>("dd_esikf/aniso_far_scale", dd_aniso_cfg_.far_scale,    5.0);
+  // dd_prior_src_ is wired by LIVMapper (which owns the IMU/visual state),
+  // not here, since VoxelMapManager has no direct IMU preintegration handle.
+
+  // Optional probe log path. If empty, logging is disabled. When set, each
+  // ESIKF frame appends one line:  frame  λ_1..λ_6  m_1..m_6  deg_rank
+  //  v_deg(3) v_obs(3)  — where v_deg is the weakest-degenerate eigenvector's
+  // position-block (the degenerate translation direction, projected to a
+  // 3-vector in the body frame for ATE-by-direction analysis).
+  nh.param<std::string>("dd_esikf/log_file", dd_log_file_, "");
+  if (!dd_log_file_.empty() && dd_enable_)
+  {
+    dd_log_.open(dd_log_file_, std::ios::out);
+    if (dd_log_.is_open())
+    {
+      dd_log_ << "# DD-ESIKF probe log\n"
+              << "# frame  lambda1..6  m1..6  deg_rank  v_deg_pos(3) v_obs_pos(3) "
+              << "last_lio_update_time\n";
+    }
+    else
+    {
+      ROS_WARN("[DD-ESIKF] failed to open log_file=%s", dd_log_file_.c_str());
+    }
+  }
+}
+
 void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPlane *plane)
 {
   plane->plane_var_ = Eigen::Matrix<double, 6, 6>::Zero();
@@ -446,8 +490,35 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
       double sigma_l = J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
 
-      R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+      // ---- Layer 6 (Theorem T6): range-dependent anisotropic LiDAR R.
+      // The base calcBodyCov builds an anisotropic body covariance (range_var
+      // along the beam, angular_var tangential). For LONG-RANGE points the
+      // depth (beam) variance grows ~range^2, but when projected onto the
+      // plane normal this depth component is largely discarded. We recover
+      // the distance information by inflating R (=> shrinking R_inv) for far
+      // points beyond a far_range threshold, so the degenerate depth
+      // direction of far points is down-weighted and degeneracy detection is
+      // sharper. Saturates at far_scale. No-op when aniso_enable is false. ----
+      double aniso_scale = 1.0;
+      if (dd_aniso_cfg_.enable)
+      {
+        const double range_i = point_this.norm();
+        if (range_i > dd_aniso_cfg_.far_range)
+        {
+          double s = (range_i - dd_aniso_cfg_.far_range) / dd_aniso_cfg_.far_range;
+          aniso_scale = 1.0 + (dd_aniso_cfg_.far_scale - 1.0) *
+                       std::min(1.0, s / (dd_aniso_cfg_.far_scale - 1.0 + 1e-9));
+        }
+      }
+      R_inv(i) = 1.0 / (aniso_scale * (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_));
       // R_inv(i) = 1.0 / (sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+      // Layer 2 (Theorem T2): scale the LiDAR measurement noise by the
+      // adaptive factor phi (NIS-EMA). A healthy filter has phi=1 (no-op);
+      // under LiDAR degeneracy / failure phi>1 inflates R => R_inv shrinks
+      // => the LiDAR contributes less information, doubly suppressed with
+      // the directional mask. Computed once per frame (iterCount==0 block
+      // below) and cached in dd_ada_phi_.
+      if (dd_ada_cfg_.enable) R_inv(i) /= dd_ada_phi_;
 
       /*** calculate the Measuremnt Jacobian matrix H ***/
       V3D A(point_crossmat * state_.rot_end.transpose() * ptpl_list_[i].normal_);
@@ -461,10 +532,46 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     /*** Iterative Kalman Filter Update ***/
     MatrixXd K(DIM_STATE, effct_feat_num_);
     // auto &&Hsub_T = Hsub.transpose();
-    auto &&HTz = Hsub_T_R_inv * meas_vec;
+    VectorXd HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
+
+    // ---- DD-ESIKF (Project A) -----------------------------------------
+    // Replace Λ_L -> Λ_eff = M Λ_L M + Λ_pr  and  H^T R^-1 z -> M H^T R^-1 z + b_pr
+    // (Theorem 3 in research/theory.tex). Computed ONCE per frame, on the
+    // FIRST inner iteration, then held fixed across inner iterations to
+    // satisfy Assumption 1 (iterate-independence, Proposition 5 convergence).
+    // When dd_enable_ is false, this is a no-op and the original ESIKF runs.
+    //
+    // P2 fused-mask (Theorem T1): the degeneracy probe runs on Λ_f = Λ_L + Λ_V
+    // (visual info from the last VIO frame, cached by LIVMapper), so visual
+    // information can only SHRINK the degenerate subspace. The mask is then
+    // applied to Λ_L only (VIO has its own ESIKF). When dd_Lambda_V_ is zero,
+    // this reduces to the original Λ_L-only probe.
+    MD(6, 6) Lambda_L_pose = H_T_H.block<6, 6>(0, 0);
+    Eigen::Matrix<double, 6, 1> HTz_pose = HTz.head<6>();
+    if (dd_enable_ && iterCount == 0)
+    {
+      dd_esikf::ESIKFInputs dd_in;
+      dd_in.Lambda_L = Lambda_L_pose;
+      dd_in.Htz      = HTz_pose;
+      dd_in.Lambda_V = dd_Lambda_V_valid_ ? dd_Lambda_V_
+                                          : Eigen::Matrix<double, 6, 6>::Zero();
+      auto dd_out = dd_esikf::applyToESIKF(dd_in, dd_cfg_, dd_prior_src_.get());
+      dd_last_probe_ = dd_out.probe_res;
+      // Cache the effective quantities in frame-local storage so inner
+      // iterations reuse them (per_frame_mask contract).
+      dd_Lambda_eff_cached_ = dd_out.Lambda_eff;
+      dd_Htz_eff_cached_    = dd_out.Htz_eff;
+    }
+    if (dd_enable_)
+    {
+      H_T_H.block<6, 6>(0, 0) = dd_Lambda_eff_cached_;
+      for (int i = 0; i < 6; ++i) HTz(i) = dd_Htz_eff_cached_(i);
+    }
+    // ---- end DD-ESIKF -------------------------------------------------
+
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
     auto vec = state_propagat - state_;
@@ -488,6 +595,28 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // _state.cov = (I_STATE - G) * _state.cov;
       state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
           (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
+
+      // ---- Layer 3 (Theorem T3): direction-decoupled covariance update on
+      // the 6×6 pose block. Standard (I-G)P falsely contracts the degenerate
+      // direction variance (a small λ_k is treated as information). Instead:
+      //   P_post = Π_obs · P_info · Π_obs  +  Π_deg · P_prior · Π_deg
+      // where P_info = (I-G)P (just computed above) and P_prior = the IMU-
+      // propagated covariance state_propagat.cov. On V_obs, Π_obs=I so the
+      // observable block keeps the standard EKF posterior (T3(iii)); on V_deg,
+      // Π_deg=I so the variance stays at the prior (grows with distance per
+      // IMU Q, never collapses — the long-range consistency guarantee T3(ii)).
+      // Projection lives in the BODY pose frame of dd_last_probe_. ----
+      if (dd_enable_ && dd_last_probe_.has_degeneracy())
+      {
+        Eigen::Matrix<double, 6, 6> P_info =
+            state_.cov.block<6, 6>(0, 0);
+        Eigen::Matrix<double, 6, 6> P_prior =
+            state_propagat.cov.block<6, 6>(0, 0);
+        Eigen::Matrix<double, 6, 6> P_decoupled =
+            dd_last_probe_.Pi_obs * P_info * dd_last_probe_.Pi_obs +
+            dd_last_probe_.Pi_deg * P_prior * dd_last_probe_.Pi_deg;
+        state_.cov.block<6, 6>(0, 0) = P_decoupled;
+      }
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
       geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
@@ -495,8 +624,43 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // VD(DIM_STATE) K_sum  = K.rowwise().sum();
       // VD(DIM_STATE) P_diag = _state.cov.diagonal();
       EKF_stop_flg = true;
+
+      // ---- Layer 2 (Theorem T2): update the adaptive LiDAR R factor from
+      // the per-frame NIS of the converged residual. phi=1 when the filter
+      // is consistent (healthy modality); phi>1 inflates R next frame,
+      // shrinking the LiDAR information contribution (doubly suppressed with
+      // the directional mask of Layer 1). ----
+      if (dd_ada_cfg_.enable)
+      {
+        double nis = 0.0;
+        for (int i = 0; i < effct_feat_num_; ++i)
+          nis += R_inv(i) * meas_vec(i) * meas_vec(i);
+        nis /= std::max(1, effct_feat_num_);
+        dd_ada_phi_ = dd_esikf::updateAdaptiveNoise(dd_ada_state_, nis, dd_ada_cfg_);
+      }
+
+      // ---- DD-ESIKF per-frame probe log (Project A eval) ----------------
+      // Write one line per CONVERGED frame: eigvals, mask coefs, degenerate
+      // rank, and the position-block (rows 3..5) of the weakest-degenerate
+      // eigenvector  v_deg  + the strongest-observable eigenvector  v_obs.
+      // The position-block of v_deg (a 3-vector) is what the eval script
+      // projects the ATE translation error onto.
+      if (dd_enable_ && dd_log_.is_open() && dd_last_probe_.has_degeneracy())
+      {
+        // weakest-degenerate direction (largest λ_k among degenerate set)
+        Eigen::Matrix<double, 6, 1> v_deg =
+            dd_last_probe_.eigvecs.col(dd_last_probe_.idx_weak);
+        // strongest-observable direction (largest eigenvalue overall)
+        Eigen::Matrix<double, 6, 1> v_obs = dd_last_probe_.eigvecs.col(0);
+        dd_log_ << dd_frame_idx_ << " ";
+        for (int k = 0; k < 6; ++k) dd_log_ << dd_last_probe_.eigvals(k) << " ";
+        for (int k = 0; k < 6; ++k) dd_log_ << dd_last_probe_.m_coefs(k) << " ";
+        dd_log_ << dd_last_probe_.deg_rank() << " "
+                << v_deg(3) << " " << v_deg(4) << " " << v_deg(5) << " "
+                << v_obs(3) << " " << v_obs(4) << " " << v_obs(5) << "\n";
+      }
     }
-    if (EKF_stop_flg) break;
+    if (EKF_stop_flg) { dd_frame_idx_++; break; }
   }
 
   // double t2 = omp_get_wtime();

@@ -14,7 +14,9 @@ which is included as part of this source code package.
 #define VOXEL_MAP_H_
 
 #include "common_lib.h"
+#include "degeneracy.h"  // DD-ESIKF (Project A): direction-decoupled masking
 #include <Eigen/Dense>
+#include <fstream>
 #include <fstream>
 #include <math.h>
 #include <mutex>
@@ -244,6 +246,42 @@ public:
 
   void mapSliding();
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
+
+  // ---- DD-ESIKF (Project A) -------------------------------------------
+  // Degeneracy-resilient fusion: optional per-frame masking + prior injection
+  // on unobservable directions of the LiDAR information matrix Λ_L.
+  // Enable via config: `degeneracy_enable` (default false => original ESIKF).
+  dd_esikf::DegeneracyConfig dd_cfg_;
+  std::shared_ptr<dd_esikf::PriorSource> dd_prior_src_;  // IMU/visual prior (optional)
+  bool dd_enable_ = false;                              // runtime toggle
+  // Latest probe result, exposed for diagnostics / plotting.
+  dd_esikf::DegeneracyResult dd_last_probe_;
+  // Per-frame cache of effective Λ and H^T R^-1 z so inner ESIKF iterations
+  // reuse the same masked quantities (Assumption 1 / Proposition 5).
+  Eigen::Matrix<double, 6, 6> dd_Lambda_eff_cached_ = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> dd_Htz_eff_cached_    = Eigen::Matrix<double, 6, 1>::Zero();
+  // ---- P2 fused-mask (Theorem T1): visual information from the last VIO
+  // frame, set by LIVMapper before calling StateEstimation. When left zero,
+  // the degeneracy probe falls back to Λ_L-only (original DD-ESIKF). ----
+  Eigen::Matrix<double, 6, 6> dd_Lambda_V_ = Eigen::Matrix<double, 6, 6>::Zero();
+  bool dd_Lambda_V_valid_ = false;
+  // ---- Layer 2 (Theorem T2): NIS-based adaptive LiDAR measurement noise. ----
+  dd_esikf::AdaptiveNoiseConfig dd_ada_cfg_;
+  dd_esikf::AdaptiveNoiseState  dd_ada_state_;
+  double dd_ada_phi_ = 1.0;   // current R scaling factor for LiDAR
+  // ---- Layer 6 (Theorem T6): range-dependent anisotropic LiDAR R. ----
+  dd_esikf::AnisoNoiseConfig dd_aniso_cfg_;
+  // Optional file logger for per-frame degeneracy probe (Project A eval).
+  std::string dd_log_file_;                          // empty => disabled
+  std::ofstream dd_log_;                             // opened in initDegeneracy
+  int dd_frame_idx_ = 0;                              // monotonic frame counter
+  void initDegeneracy(ros::NodeHandle &nh);              // read params from ROS
+  // P2: receive the cached VIO pose information block (called by LIVMapper).
+  void setVisualInfo(const Eigen::Matrix<double, 6, 6>& Lambda_V,
+                     bool valid) {
+    dd_Lambda_V_ = Lambda_V;
+    dd_Lambda_V_valid_ = valid;
+  }
 
 private:
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);

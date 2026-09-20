@@ -1433,8 +1433,40 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
     M3D p_hat;
 
-    for (int i = 0; i < total_points; i++)
+    // ---- Layer 5 (Theorem T5): cross-modal degeneracy-driven patch budget.
+    // (Inverse-composition variant. Same scoring proxy as updateState.)
+    std::vector<int> active_idx;
+    active_idx.reserve(total_points);
+    if (cross_modal_select_enable && lio_Pi_deg_valid)
     {
+      std::vector<std::pair<double,int>> scored;
+      scored.reserve(total_points);
+      for (int i = 0; i < total_points; ++i)
+      {
+        VisualPoint *pt = visual_submap->voxel_points[i];
+        if (pt == nullptr) { scored.emplace_back(-1.0, i); continue; }
+        V3D pf = Rcw * pt->pos_ + Pcw;
+        M3D ph; ph << SKEW_SYM_MATRX(pf);
+        MD(2,3) Jd; computeProjectionJacobian(pf, Jd);
+        Eigen::Matrix<double, 3, 3> Pi_p = lio_Pi_deg.block<3, 3>(3, 3);
+        double sc = (Jd * ph * Pi_p).squaredNorm();
+        scored.emplace_back(sc, i);
+      }
+      int budget = (cross_modal_budget > 0)
+                   ? std::min(cross_modal_budget, total_points)
+                   : total_points;
+      std::partial_sort(scored.begin(), scored.begin() + budget, scored.end(),
+                        std::greater<std::pair<double,int>>());
+      for (int k = 0; k < budget; ++k) active_idx.push_back(scored[k].second);
+    }
+    else
+    {
+      for (int i = 0; i < total_points; ++i) active_idx.push_back(i);
+    }
+
+    for (int idx = 0; idx < (int)active_idx.size(); idx++)
+    {
+      int i = active_idx[idx];
       float patch_error = 0.0;
 
       const int scale = (1 << level);
@@ -1496,6 +1528,11 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       auto &&HTz = H_sub_T * z;
+      // ---- P2 fused-mask: cache the VIO pose information block (6×6 + 6×1)
+      // for the LIO degeneracy probe on Λ_f = Λ_L + Λ_V (Theorem T1). ----
+      last_Lambda_V = H_T_H.block<6, 6>(0, 0);
+      last_b_V      = HTz.head<6>();
+      last_V_valid  = true;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
       auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
@@ -1545,16 +1582,58 @@ void VIOManager::updateState(cv::Mat img, int level)
     
     float error = 0.0;
     int n_meas = 0;
-    // int max_threads = omp_get_max_threads();
-    // int desired_threads = std::min(max_threads, total_points);
-    // omp_set_num_threads(desired_threads);
-  
+
+    // ---- Layer 5 (Theorem T5): cross-modal degeneracy-driven patch budget.
+    // Score each visual point by the trace of its per-patch pose-information
+    // projected onto Π_deg (the LiDAR degenerate subspace). Select the top-k
+    // budget. A patch's pose information ≈ (JdR, Jdt)^T (JdR, Jdt) / img_cov;
+    // its Π_deg-trace measures how much it strengthens the degenerate dir.
+    // We compute a cheap scalar proxy: the norm of (Jdt onto Π_deg block),
+    // using the translation Jacobian only (rotation contributes similarly).
+    // No-op when cross_modal_select_enable is false or Π_deg unavailable. ----
+    std::vector<int> active_idx;
+    active_idx.reserve(total_points);
+    if (cross_modal_select_enable && lio_Pi_deg_valid)
+    {
+      // Pre-compute a per-point score. We approximate the patch pose-info by
+      // the squared translation Jacobian (the dominant term for far points).
+      std::vector<std::pair<double,int>> scored;
+      scored.reserve(total_points);
+      for (int i = 0; i < total_points; ++i)
+      {
+        VisualPoint *pt = visual_submap->voxel_points[i];
+        if (pt == nullptr) { scored.emplace_back(-1.0, i); continue; }
+        V3D pf = Rcw * pt->pos_ + Pcw;
+        M3D p_hat; p_hat << SKEW_SYM_MATRX(pf);
+        MD(2,3) Jdpi; computeProjectionJacobian(pf, Jdpi);
+        // Translation Jacobian of the photometric residual wrt body t:
+        // Jdt = -Jimg * Jdpi, and Jimg ~ image gradient (unknown pre-loop).
+        // Use the projection-Jacobian Frobenius projected onto Π_deg's
+        // position block (rows/cols 3..5) as a geometry-only proxy.
+        Eigen::Matrix<double, 3, 3> Pi_p =
+            lio_Pi_deg.block<3, 3>(3, 3);
+        double sc = (Jdpi * p_hat * Pi_p).squaredNorm();
+        scored.emplace_back(sc, i);
+      }
+      int budget = (cross_modal_budget > 0)
+                   ? std::min(cross_modal_budget, total_points)
+                   : total_points;
+      std::partial_sort(scored.begin(), scored.begin() + budget, scored.end(),
+                        std::greater<std::pair<double,int>>());
+      for (int k = 0; k < budget; ++k) active_idx.push_back(scored[k].second);
+    }
+    else
+    {
+      for (int i = 0; i < total_points; ++i) active_idx.push_back(i);
+    }
+
     #ifdef MP_EN
       omp_set_num_threads(MP_PROC_NUM);
       #pragma omp parallel for reduction(+:error, n_meas)
     #endif
-    for (int i = 0; i < total_points; i++)
+    for (int idx = 0; idx < (int)active_idx.size(); idx++)
     {
+      int i = active_idx[idx];
       // printf("thread is %d, i=%d, i address is %p\n", omp_get_thread_num(), i, &i);
       MD(1, 2) Jimg;
       MD(2, 3) Jdpi;
@@ -1657,9 +1736,45 @@ void VIOManager::updateState(cv::Mat img, int level)
       auto &&H_sub_T = H_sub.transpose();
       H_T_H.setZero();
       G.setZero();
+
+      // ---- Layer 7 (Theorem T7): robust t-distribution reweighting of the
+      // visual photometric residual. Apply IRLS weights w_j derived from the
+      // running residual variance, so outlier pixels (long-baseline blur,
+      // lighting changes) contribute bounded pseudo-information instead of
+      // corrupting the visual ESIKF. Weights are computed from the residual
+      // vector z computed at this iteration; sigma2 is EMA-updated. When
+      // robust_vio_enable is false this is a complete no-op. ----
+      Eigen::VectorXd w(z.size());
+      w.setOnes();
+      if (robust_vio_enable)
+      {
+        // Update running variance (EMA of r_j^2).
+        double cur_var = z.dot(z) / std::max(1, (int)z.size());
+        robust_vio_sigma2 = (1.0 - robust_vio_alpha) * robust_vio_sigma2
+                          + robust_vio_alpha * cur_var;
+        const double s2 = std::max(robust_vio_sigma2, 1e-6);
+        const double nu = robust_vio_nu;
+        for (int j = 0; j < z.size(); ++j)
+        {
+          double r2s2 = (z(j) * z(j)) / s2;
+          w(j) = (nu + 2.0) / (nu + r2s2);   // t-IRLS weight
+        }
+        // Apply weights: H_w = w^{1/2} H, z_w = w^{1/2} z (sqrt since w in
+        // the normal equations appears as w^2). Use sqrt.
+        for (int j = 0; j < z.size(); ++j) w(j) = std::sqrt(w(j));
+        z = z.cwiseProduct(w);
+        for (int r = 0; r < H_sub.rows(); ++r)
+          H_sub.row(r) *= w(r);
+      }
+
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       auto &&HTz = H_sub_T * z;
+      // ---- P2 fused-mask: cache the VIO pose information block (6×6 + 6×1)
+      // for the LIO degeneracy probe on Λ_f = Λ_L + Λ_V (Theorem T1). ----
+      last_Lambda_V = H_T_H.block<6, 6>(0, 0);
+      last_b_V      = HTz.head<6>();
+      last_V_valid  = true;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 7>(0, 0) = K_1.block<DIM_STATE, 7>(0, 0) * H_T_H.block<7, 7>(0, 0);

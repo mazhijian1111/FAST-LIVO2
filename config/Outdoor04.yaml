@@ -1,0 +1,110 @@
+common:
+  # Topics recorded in Outdoor04.bag.
+  img_topic: "/outdoor04/camera/color/image_raw"
+  lid_topic: "/livox/avia/lidar"
+  imu_topic: "/livox/avia/imu"
+  img_en: 1
+  lidar_en: 1
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  # avia -> avia_imu (from calibration.md, identity rotation).
+  extrinsic_T: [0.04165, 0.02326, -0.0284]
+  extrinsic_R: [1, 0, 0,
+                0, 1, 0,
+                0, 0, 1]
+
+  # avia -> camera, p_camera = Rcl * p_avia + Pcl.
+  Rcl: [0.0210767, -0.999397, -0.0275965,
+        -0.0038717, 0.0275209, -0.999614,
+        0.9997703, 0.0211754, -0.0032894]
+  Pcl: [0.0178448, 0.0894589, 0.161556]
+
+time_offset:
+  # No time offset is supplied in calibration.md; keep the recorded timestamps.
+  imu_time_offset: 0.0
+  img_time_offset: 0.0
+  exposure_time_init: 0.0
+
+preprocess:
+  point_filter_num: 1
+  filter_size_surf: 0.1
+  lidar_type: 1 # Livox Avia
+  scan_line: 6
+  blind: 0.8
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 1000
+  img_point_cov: 100
+  # Layer 7 (Theorem T7): robust t-distribution visual residual (Project A).
+  robust_vio_enable: false
+  robust_vio_nu: 3.0
+  robust_vio_alpha: 0.1
+  # Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
+  cross_modal_select_enable: false
+  cross_modal_budget: -1
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  # Runtime covariance scales retained from the Avia preset. The Allan values
+  # in calibration.md are documented calibration densities, not these scales.
+  acc_cov: 0.5
+  gyr_cov: 0.3
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  # Layer 8: distance-inflated IMU process noise (Project A).
+  dist_noise_enable: false
+  dist_noise_d_ref: 100.0
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.0025
+  voxel_size: 0.5
+  max_layer: 2
+  max_points_num: 50
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:
+  map_sliding_en: false
+  half_map_size: 100
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: false
+
+publish:
+  dense_map_en: true
+  pub_effect_point_en: false
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "Outdoor04"
+  # Set true for DD-ESIKF sweeps so FAST-LIVO2 writes TUM poses to
+  # Log/result/<seq_name>.txt (mapping_Outdoor04_dd.launch overrides seq_name
+  # per-method). Safe to leave true for normal runs too.
+  pose_output_en: true
+
+pcd_save:
+  pcd_save_en: false
+  type: 0
+  colmap_output_en: false
+  filter_size_pcd: 0.15
+  interval: -1
+
+image_save:
+  img_save_en: false
+  interval: 1

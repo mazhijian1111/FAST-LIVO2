@@ -1,0 +1,121 @@
+# =============================================================================
+# DD-ESIKF (Project A) — Direction-Decoupled ESIKF configuration.
+# Appended to any FAST-LIVO2 base config (e.g. avia.yaml) to enable the
+# selective degeneracy-resilient fusion. All params default to OFF, so loading
+# this file alongside the base config is the ONLY change needed to switch
+# between B0 (standard ESIKF), B2 (mask only), B3 (mask + prior).
+# =============================================================================
+#
+# To run a comparison sweep, set `enable: true` and vary `default_prior_info`:
+#   B0:  enable: false                    (standard ESIKF, original behavior)
+#   B2:  enable: true,  default_prior_info: 0.0    (mask only, no prior)
+#   B3:  enable: true,  default_prior_info: 5.0    (mask + constant prior floor)
+# (For a real IMU-driven prior instead of the constant floor, wire
+#  dd_prior_src_ in LIVMapper.cpp to an IMUPreintegrationPrior instance —
+#  see the note at the bottom of this file.)
+# =============================================================================
+
+dd_esikf:
+  # Master switch. false => DD-ESIKF is a complete no-op, original ESIKF runs
+  # untouched (guaranteed backward compatibility).
+  enable: false
+
+  # Degeneracy criterion (Definition 1 in theory.tex). A direction v_k is
+  # degenerate iff  λ_k < tau_abs  OR  λ_k/λ_1 < tau_rel.
+  # Default 1.0 flags both the strictly-unobservable (λ=0) and the
+  # weakly-observable (λ~0.2) directions in the tilted-corridor simulation.
+  # Tune per scene: a larger value makes the mask more aggressive.
+  tau_abs: 1.0
+  tau_rel: 0.001
+
+  # Mask shape (Proposition 5 / Assumption 1).
+  # false (default) => continuous mask m_k = clip(λ_k/tau_abs, 0, 1).
+  # true             => hard 0/1 mask (stricter consistency guarantee, Corollary).
+  hard_mask: false
+
+  # Constant prior information floor injected along EVERY degenerate direction
+  # when no PriorSource is wired (i.e. dd_prior_src_ == nullptr in code).
+  # 0.0  => pure masking (B2). The degenerate dir gets no information and its
+  #        variance does not contract (Theorem 4 / Corollary).
+  # >0   => constant-information prior (a simplified B3). The degenerate dir is
+  #        pulled toward zero with information = default_prior_info. Useful for
+  #        ablation without wiring a real IMU prior.
+  default_prior_info: 0.0
+
+  # Compute the mask ONCE per frame (before the ESIKF inner iteration loop) and
+  # hold it constant across inner iterations. Required by Assumption 1
+  # (iterate-independence) for Proposition 5 (convergence). KEEP TRUE.
+  per_frame_mask: true
+
+  # ---------------------------------------------------------------------------
+  # P2 fused-mask (Theorem T1): probe degeneracy on Λ_f = Λ_L + Λ_V instead of
+  # Λ_L only. The visual information matrix Λ_V is the 6×6 pose block cached by
+  # VIOManager::updateState from the most recent VIO frame (one frame stale
+  # w.r.t. the LIO step). Because visual info can only SHRINK the degenerate
+  # subspace (V_deg(Λ_f) ⊆ V_deg(Λ_L)), this minimizes prior injection and
+  # reliance on the prior. The mask is still applied to Λ_L only — VIO keeps its
+  # own ESIKF. No separate switch: loading dd_esikf.yaml + VIO caching the block
+  # is enough; set this false to force Λ_L-only probing even when Λ_V exists.
+  fused_mask: true
+
+  # ---------------------------------------------------------------------------
+  # Layer 2 (Theorem T2): NIS-based adaptive LiDAR measurement noise.
+  # Maintains an EMA rho of the per-frame residual NIS; a healthy (observable)
+  # LiDAR has rho→1 and phi→1 (no-op, original behaviour). Under LiDAR
+  # degeneracy / failure rho grows, phi grows, R is inflated => the LiDAR
+  # contributes less information (doubly suppressed with the directional mask).
+  adaptive_enable: false
+  adaptive_alpha: 0.05        # EMA forgetting factor (small => slow adaptation)
+  adaptive_phi_min: 1.0       # R scaling floor (never shrink R below nominal)
+  adaptive_phi_max: 20.0      # R scaling ceiling (avoid unbounded inflation)
+  adaptive_ramp_thr: 1.5      # rho above which phi starts ramping up
+
+  # ---------------------------------------------------------------------------
+  # Layer 6 (Theorem T6): range-dependent anisotropic LiDAR measurement noise.
+  # For long-range points the depth (beam) variance grows ~range^2 but is
+  # largely discarded when projected onto the plane normal. We recover the
+  # distance information by inflating R (shrinking R_inv) for far points,
+  # so the degenerate depth direction is down-weighted and degeneracy
+  # detection is sharper. Saturates at far_scale. No-op when enable is false.
+  aniso_enable: false
+  aniso_far_range: 30.0     # range [m] beyond which R starts inflating
+  aniso_far_scale: 5.0      # max multiplicative inflation of R
+
+  # ---------------------------------------------------------------------------
+  # Layer 5 (Theorem T5): cross-modal degeneracy-driven visual patch select.
+  # Scores each visual patch by the trace of its pose-information projected
+  # onto the LiDAR degenerate projector Π_deg, then greedily selects a budget
+  # of top-k patches (submodular, 1-1/e bound). Routes visual information into
+  # the directions where LiDAR is weak. Loaded into VIOManager via the
+  # vio/* params in the base config (avia.yaml / Outdoor04.yaml).
+  # NOTE: the actual switch params live under `vio:` in the base config:
+  #   vio/cross_modal_select_enable (bool, default false)
+  #   vio/cross_modal_budget       (int,  -1 = use all, >0 = top-k)
+  # They are documented here for reference; the base config is the source.
+
+  # ---------------------------------------------------------------------------
+  # Layer 8: distance-inflated IMU process noise. Params live under `imu:`
+  # in the base config (imu/dist_noise_enable, imu/dist_noise_d_ref). See
+  # the base config for their defaults.
+
+  # Optional per-frame probe log file (absolute path recommended). When set
+  # AND enable:true, VoxelMapManager appends one line per converged frame:
+  #   frame  lambda1..6  m1..6  deg_rank  v_deg_pos(3) v_obs_pos(3)
+  # The v_deg_pos / v_obs_pos 3-vectors are the position-block (rows 3..5) of
+  # the weakest-degenerate and strongest-observable eigenvectors. They are
+  # what eval_ate_by_direction.py projects the ATE translation error onto.
+  # Leave empty to disable logging.
+  log_file: ""
+
+# -----------------------------------------------------------------------------
+# NOTES
+# -----------------------------------------------------------------------------
+# 1. The mask is computed on the 6×6 LiDAR pose information matrix Λ_L =
+#    H^T R^-1 H (assembled at voxel_map.cpp:479). It does NOT touch the VIO /
+#    visual residual path — those still run unmodified.
+#
+# 2. For a real IMU preintegration prior (full B3), set enable:true and wire
+#    dd_prior_src_ in LIVMapper.cpp to an IMUPreintegrationPrior built from the
+#    ImuProcess Δpose and its covariance. The class is defined in
+#    include/degeneracy.h and takes (dpos, drot, imu_delta_cov, info_scale).
+#    Until that wiring is done, default_prior_info is the only prior source.

@@ -1,0 +1,64 @@
+<launch>
+<!-- =============================================================================
+     DD-ESIKF (Project A) — Direction-Decoupled ESIKF on MD3GR Outdoor04.bag.
+     Mirrors mapping_avia_dd.launch but loads the Outdoor04 base config
+     (config/Outdoor04.yaml) + camera config (config/camera_Outdoor04.yaml)
+     and keeps the Outdoor04 image-decompress node (the bag stores the RGB
+     stream as sensor_msgs/CompressedImage).
+
+     Comparison grid (set dd_esikf/enable and dd_esikf/default_prior_info):
+       B0: dd_esikf/enable:=false                 # standard ESIKF (baseline)
+       B2: dd_esikf/enable:=true  default_prior_info:=0.0   # mask only
+       B3: dd_esikf/enable:=true  default_prior_info:=5.0   # mask + prior floor
+
+     Outputs (when evo/pose_output_en:true in Outdoor04.yaml):
+       TUM poses -> $(find fast_livo)/Log/result/<seq_name>.txt
+     The sweep script copies this into results/<seq>/<method>/poses.txt.
+     The DD probe log goes to dd_esikf/log_file (set per-method by the sweep).
+     ============================================================================= -->
+
+	<arg name="rviz" default="true" />
+	<arg name="play_bag" default="false" />
+	<arg name="bag" default="/home/mzj/2.dataset/MD3GR/Outdoor04.bag" />
+	<arg name="bag_rate" default="1.0" />
+
+	<arg name="dd_enable" default="true" />
+	<arg name="dd_prior_info" default="0.0" />
+	<arg name="dd_log_file" default="" />
+	<arg name="seq_name" default="Outdoor04_dd" />
+
+	<param name="use_sim_time" value="true" />
+
+	<!-- Base FAST-LIVO2 params (lidar/imu/extrinsics/lio/vio/... for MD3GR) -->
+	<rosparam command="load" file="$(find fast_livo)/config/Outdoor04.yaml" />
+
+	<!-- DD-ESIKF params (Project A). Loaded after Outdoor04.yaml so dd_esikf/*
+	     keys are present for VoxelMapManager::initDegeneracy to read. -->
+	<rosparam command="load" file="$(find fast_livo)/config/dd_esikf.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+		<rosparam file="$(find fast_livo)/config/camera_Outdoor04.yaml" />
+		<!-- Runtime overrides for the comparison sweep (override dd_esikf.yaml) -->
+		<param name="dd_esikf/enable"             value="$(arg dd_enable)" />
+		<param name="dd_esikf/default_prior_info"  value="$(arg dd_prior_info)" />
+		<param name="dd_esikf/log_file"            value="$(arg dd_log_file)" />
+		<!-- Override the evo seq_name so each method writes its own pose file. -->
+		<param name="evo/seq_name"                 value="$(arg seq_name)" />
+	</node>
+
+	<!-- The bag stores the RGB stream as sensor_msgs/CompressedImage. -->
+	<node pkg="image_transport" type="republish" name="outdoor04_image_decompress"
+	      args="compressed in:=/camera/color/image_raw raw out:=/outdoor04/camera/color/image_raw"
+	      output="screen" respawn="true" />
+
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+		      args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+	</group>
+
+	<group if="$(arg play_bag)">
+		<node pkg="rosbag" type="play" name="outdoor04_bag"
+		      args="--clock -r $(arg bag_rate) $(arg bag)" output="screen" />
+	</group>
+
+</launch>

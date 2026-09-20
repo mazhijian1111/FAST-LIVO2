@@ -129,6 +129,16 @@ public:
   vector<double> cameraextrinT;
   vector<double> cameraextrinR;
   double IMG_POINT_COV;
+  // Layer 7 (Theorem T7): robust t-distribution visual residual.
+  bool   robust_vio_enable = false;
+  double robust_vio_nu     = 3.0;
+  double robust_vio_alpha  = 0.1;
+  // Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
+  bool   cross_modal_select_enable = false;
+  int    cross_modal_budget        = -1;
+  // Layer 8: distance-inflated IMU process noise.
+  bool   dist_noise_enable = false;
+  double dist_noise_d_ref  = 100.0;
 
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;

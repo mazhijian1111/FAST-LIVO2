@@ -107,6 +107,31 @@ public:
   int max_iterations, total_points;
 
   double img_point_cov, outlier_threshold, ncc_thre;
+  // ---- Layer 7 (Theorem T7): robust t-distribution visual residual. ----
+  // When robust_vio_enable is true, each photometric residual is reweighted
+  // by a t-distribution weight w_j = (nu+2)/(nu + r_j^2/sigma^2), computed
+  // from the running per-level residual variance sigma^2. This bounds the
+  // influence of outlier pixels (long-baseline blur, lighting changes) so
+  // the visual pseudo-information on degenerate directions is O(eps) instead
+  // of O(1) — the breakdown bound of Theorem T7. When false, the original
+  // fixed-sigma least-squares behaviour is unchanged.
+  bool   robust_vio_enable = false;
+  double robust_vio_nu    = 3.0;     // t-distribution DOF (3 = heavy tail)
+  double robust_vio_sigma2 = 100.0; // running residual variance (EMA-updated)
+  double robust_vio_alpha  = 0.1;   // EMA factor for sigma2 update
+  // ---- Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select. --
+  // When enabled, the visual update selects a budget of top-k patches that
+  // maximize the trace of their pose-information projected onto the LiDAR
+  // degenerate subspace Π_deg (cached by VoxelMapManager::dd_last_probe_).
+  // This quantitatively routes visual information into the directions where
+  // LiDAR is weak (T5: a submodular greedy bound). When disabled, ALL valid
+  // patches are used (original FAST-LIVO2 behaviour). The Π_deg matrix is
+  // pushed in from LIVMapper (which owns both managers) each VIO frame.
+  bool   cross_modal_select_enable = false;
+  int    cross_modal_budget = -1;   // -1 = use all; >0 = top-k greedy
+  Eigen::Matrix<double, 6, 6> lio_Pi_deg =
+      Eigen::Matrix<double, 6, 6>::Zero();
+  bool   lio_Pi_deg_valid = false;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
@@ -121,6 +146,15 @@ public:
 
   Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
   MatrixXd K, H_sub_inv;
+
+  // ---- P2 fused-mask (Project A): cache the VIO pose information block ----
+  // Λ_V (6×6 pose) + b_V (6×1 pose) from the most recent VIO ESIKF update, so
+  // the LIO step can probe degeneracy on Λ_f = Λ_L + Λ_V (Theorem T1). The
+  // cache is ONE VIO frame stale w.r.t. the current LIO step (LIO/VIO run at
+  // different timestamps); slow-motion approximation, documented limitation.
+  Eigen::Matrix<double, 6, 6> last_Lambda_V = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> last_b_V      = Eigen::Matrix<double, 6, 1>::Zero();
+  bool last_V_valid = false;
 
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;

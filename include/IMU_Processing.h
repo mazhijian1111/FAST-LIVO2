@@ -57,6 +57,15 @@ public:
   V3D cov_bias_gyr;
   V3D cov_bias_acc;
   double cov_inv_expo;
+  // ---- Layer 8: distance-inflated process noise. When dist_noise_enable is
+  // true, the IMU process-noise covariance is scaled by (1 + d/d_ref) where d
+  // is the travelled distance since reset; this lets the prior information on
+  // degenerate directions decay with distance (so the prior does not
+  // over-constrain after long dead-reckoning stretches) while the drift
+  // variance grows in a controlled way (T8: bounded prior information). ----
+  bool   dist_noise_enable = false;
+  double dist_noise_d_ref = 100.0;  // reference distance [m] for 2x inflation
+  double dist_noise_scale = 1.0;    // current scale factor (updated per IMU step)
   double first_lidar_time;
   bool imu_time_init = false;
   bool imu_need_init = true;

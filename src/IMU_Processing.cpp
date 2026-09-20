@@ -398,6 +398,19 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt * dt; // bias gyro covariance
       cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt * dt; // bias acc covariance
 
+      // ---- Layer 8: distance-inflated process noise. Scale cov_w by a
+      // distance-dependent factor so the prior information on degenerate
+      // directions decays with travelled distance (no over-constraint after
+      // long dead-reckoning), while drift variance grows in a controlled
+      // way. d is approximated by the position norm from the reset origin
+      // (a per-step travelled-distance integrator would be more precise).
+      if (dist_noise_enable)
+      {
+        double d = state_inout.pos_end.norm();
+        dist_noise_scale = 1.0 + d / std::max(dist_noise_d_ref, 1e-6);
+        cov_w *= dist_noise_scale;
+      }
+
       state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
       // state_inout.cov.block<18,18>(0,0) = F_x.block<18,18>(0,0) *
       // state_inout.cov.block<18,18>(0,0) * F_x.block<18,18>(0,0).transpose() +

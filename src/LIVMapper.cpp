@@ -37,6 +37,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_wait_save.reset(new PointCloudXYZRGB());
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
+  voxelmap_manager->initDegeneracy(nh);   // DD-ESIKF (Project A): read params, default OFF
   vio_manager.reset(new VIOManager());
   root_dir = ROOT_DIR;
   initializeFiles();
@@ -68,6 +69,13 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("vio/patch_pyrimid_level", patch_pyrimid_level, 3);
   nh.param<int>("vio/patch_size", patch_size, 8);
   nh.param<double>("vio/outlier_threshold", outlier_threshold, 1000);
+  // Layer 7 (Theorem T7): robust t-distribution visual residual.
+  nh.param<bool>  ("vio/robust_vio_enable", robust_vio_enable, false);
+  nh.param<double>("vio/robust_vio_nu",     robust_vio_nu,     3.0);
+  nh.param<double>("vio/robust_vio_alpha", robust_vio_alpha,  0.1);
+  // Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
+  nh.param<bool>  ("vio/cross_modal_select_enable", cross_modal_select_enable, false);
+  nh.param<int>   ("vio/cross_modal_budget",        cross_modal_budget,        -1);
 
   nh.param<double>("time_offset/exposure_time_init", exposure_time_init, 0.0);
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
@@ -84,6 +92,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
+  // Layer 8: distance-inflated IMU process noise.
+  nh.param<bool>  ("imu/dist_noise_enable", dist_noise_enable, false);
+  nh.param<double>("imu/dist_noise_d_ref",  dist_noise_d_ref,  100.0);
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
@@ -143,12 +154,20 @@ void LIVMapper::initializeComponents()
   vio_manager->grid_n_height = grid_n_height;
   vio_manager->patch_pyrimid_level = patch_pyrimid_level;
   vio_manager->exposure_estimate_en = exposure_estimate_en;
+  vio_manager->robust_vio_enable = robust_vio_enable;
+  vio_manager->robust_vio_nu     = robust_vio_nu;
+  vio_manager->robust_vio_alpha  = robust_vio_alpha;
+  vio_manager->robust_vio_sigma2 = (double)IMG_POINT_COV;  // init from nominal cov
+  vio_manager->cross_modal_select_enable = cross_modal_select_enable;
+  vio_manager->cross_modal_budget        = cross_modal_budget;
   vio_manager->colmap_output_en = colmap_output_en;
   vio_manager->initializeVIO();
 
   p_imu->set_extrinsic(extT, extR);
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));
   p_imu->set_acc_cov_scale(V3D(acc_cov, acc_cov, acc_cov));
+  p_imu->dist_noise_enable = dist_noise_enable;
+  p_imu->dist_noise_d_ref  = dist_noise_d_ref;
   p_imu->set_inv_expo_cov(inv_expo_cov);
   p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
@@ -278,7 +297,7 @@ void LIVMapper::stateEstimationAndMapping()
   }
 }
 
-void LIVMapper::handleVIO() 
+void LIVMapper::handleVIO()
 {
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -300,6 +319,19 @@ void LIVMapper::handleVIO()
   else 
   {
     vio_manager->plot_flag = false;
+  }
+
+  // Layer 5 (Theorem T5): push the LiDAR degenerate projector Π_deg from
+  // VoxelMapManager into the VIO manager so the cross-modal patch selector
+  // can score patches by how much they strengthen the degenerate direction.
+  if (voxelmap_manager->dd_enable_ && voxelmap_manager->dd_last_probe_.has_degeneracy())
+  {
+    vio_manager->lio_Pi_deg      = voxelmap_manager->dd_last_probe_.Pi_deg;
+    vio_manager->lio_Pi_deg_valid = true;
+  }
+  else
+  {
+    vio_manager->lio_Pi_deg_valid = false;
   }
 
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
@@ -366,6 +398,13 @@ void LIVMapper::handleLIO()
   }
 
   double t1 = omp_get_wtime();
+
+  // P2 fused-mask (Theorem T1): hand the most recent VIO pose information
+  // block to the LIO step so the degeneracy probe runs on Λ_f = Λ_L + Λ_V.
+  // Λ_V is one VIO frame stale (LIO/VIO run at different timestamps); a
+  // slow-motion approximation, documented in degeneracy.h.
+  if (vio_manager->last_V_valid)
+    voxelmap_manager->setVisualInfo(vio_manager->last_Lambda_V, true);
 
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
