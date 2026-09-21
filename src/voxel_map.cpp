@@ -56,6 +56,7 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
 void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
 {
   nh.param<bool>  ("dd_esikf/enable",            dd_enable_,                false);
+  nh.param<bool>  ("dd_esikf/fused_mask",        dd_fused_mask_,            true);
   nh.param<double>("dd_esikf/tau_abs",           dd_cfg_.tau_abs,           1.0);
   nh.param<double>("dd_esikf/tau_rel",           dd_cfg_.tau_rel,           1e-3);
   nh.param<bool>  ("dd_esikf/hard_mask",        dd_cfg_.hard_mask,         false);
@@ -71,6 +72,8 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
   nh.param<bool>  ("dd_esikf/aniso_enable",   dd_aniso_cfg_.enable,      false);
   nh.param<double>("dd_esikf/aniso_far_range", dd_aniso_cfg_.far_range,   30.0);
   nh.param<double>("dd_esikf/aniso_far_scale", dd_aniso_cfg_.far_scale,    5.0);
+  // Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) mode.
+  nh.param<bool>  ("dd_esikf/fej_enable",      fej_enable_,                false);
   // dd_prior_src_ is wired by LIVMapper (which owns the IMU/visual state),
   // not here, since VoxelMapManager has no direct IMU preintegration handle.
 
@@ -537,6 +540,27 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
 
+    // ---- Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) on the pose
+    // block. The re-linearizing ESIKF rebuilds Hsub/A/Λ_L from the moving
+    // iterate state_ each inner iteration, so a small-but-nonzero eigenvalue
+    // drifts as H shifts, injecting fictitious information into weakly-
+    // observable directions (the FEJ literature's consistency leak, F5).
+    // FEJ freezes the pose-block information matrix Λ_L and the observation-
+    // info vector HTz at the FIRST inner iteration's linearization point and
+    // reuses them every subsequent iteration. (The DD-ESIKF block below then
+    // operates on this frozen Λ_L; when DD is off, the frozen Λ_L/HTz are
+    // written straight back.) ----
+    if (fej_enable_ && iterCount == 0)
+    {
+      dd_Lambda_L_cached_ = H_T_H.block<6, 6>(0, 0);
+      dd_Htz_cached_      = HTz.head<6>();
+    }
+    if (fej_enable_)
+    {
+      H_T_H.block<6, 6>(0, 0) = dd_Lambda_L_cached_;
+      for (int i = 0; i < 6; ++i) HTz(i) = dd_Htz_cached_(i);
+    }
+
     // ---- DD-ESIKF (Project A) -----------------------------------------
     // Replace Λ_L -> Λ_eff = M Λ_L M + Λ_pr  and  H^T R^-1 z -> M H^T R^-1 z + b_pr
     // (Theorem 3 in research/theory.tex). Computed ONCE per frame, on the
@@ -556,8 +580,11 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       dd_esikf::ESIKFInputs dd_in;
       dd_in.Lambda_L = Lambda_L_pose;
       dd_in.Htz      = HTz_pose;
-      dd_in.Lambda_V = dd_Lambda_V_valid_ ? dd_Lambda_V_
-                                          : Eigen::Matrix<double, 6, 6>::Zero();
+      // T1 fused-mask: probe on Λ_f = Λ_L + Λ_V only when dd_fused_mask_ is
+      // true AND a valid Λ_V is available; otherwise Λ_V = 0 (Λ_L-only probe).
+      dd_in.Lambda_V = (dd_fused_mask_ && dd_Lambda_V_valid_)
+                           ? dd_Lambda_V_
+                           : Eigen::Matrix<double, 6, 6>::Zero();
       auto dd_out = dd_esikf::applyToESIKF(dd_in, dd_cfg_, dd_prior_src_.get());
       dd_last_probe_ = dd_out.probe_res;
       // Cache the effective quantities in frame-local storage so inner
@@ -577,6 +604,14 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    // ---- Layer 4 (Theorem T4) note: the prior term vec = state_propagat -
+    // state_ uses the moving iterate state_, which is the ESIKF convention
+    // (re-linearize the prior anchor). A strict full-state FEJ would also
+    // freeze state_ in `vec` at iter 0. We keep the standard ESIKF prior
+    // (moving) because (i) the prior is genuinely the propagated state and
+    // (ii) the pose-block FEJ above already eliminates the dominant
+    // fictitious-observability leak (F5); freezing the prior term would
+    // over-constrain and is left as a documented simplification.
     int minRow, minCol;
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);

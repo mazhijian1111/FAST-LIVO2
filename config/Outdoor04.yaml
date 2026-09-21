@@ -38,12 +38,14 @@ vio:
   outlier_threshold: 1000
   img_point_cov: 100
   # Layer 7 (Theorem T7): robust t-distribution visual residual (Project A).
-  robust_vio_enable: false
+  robust_vio_enable: true
   robust_vio_nu: 3.0
   robust_vio_alpha: 0.1
   # Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
-  cross_modal_select_enable: false
-  cross_modal_budget: -1
+  # >>> ENABLED — T5 greedily routes visual information into the LiDAR
+  #     degenerate subspace (submodular 1-1/e bound). Needs DD-ESIKF on.
+  cross_modal_select_enable: true
+  cross_modal_budget: 200
   patch_size: 8
   patch_pyrimid_level: 4
   normal_en: true

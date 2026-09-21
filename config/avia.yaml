@@ -38,8 +38,11 @@ vio:
   robust_vio_nu: 3.0
   robust_vio_alpha: 0.1
   # Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
-  cross_modal_select_enable: false
-  cross_modal_budget: -1       # -1 = use all patches; >0 = top-k greedy
+  # >>> ENABLED — T5 greedily routes visual information into the LiDAR
+  #     degenerate subspace (submodular 1-1/e bound). Needs DD-ESIKF on (it
+  #     reads Π_deg from VoxelMapManager::dd_last_probe_).
+  cross_modal_select_enable: true
+  cross_modal_budget: 200      # top-k patches; -1 = use all
   patch_size: 8
   patch_pyrimid_level: 4
   normal_en: true

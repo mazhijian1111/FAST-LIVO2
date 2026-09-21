@@ -18,7 +18,9 @@
 dd_esikf:
   # Master switch. false => DD-ESIKF is a complete no-op, original ESIKF runs
   # untouched (guaranteed backward compatibility).
-  enable: false
+  # >>> ENABLED — Layer 1 (T1 fused mask) is a core theorem of the DRIM-ESIKF
+  #     framework and must be on for T3/T5 to have a degenerate subspace to act on.
+  enable: true
 
   # Degeneracy criterion (Definition 1 in theory.tex). A direction v_k is
   # degenerate iff  λ_k < tau_abs  OR  λ_k/λ_1 < tau_rel.
@@ -40,7 +42,9 @@ dd_esikf:
   # >0   => constant-information prior (a simplified B3). The degenerate dir is
   #        pulled toward zero with information = default_prior_info. Useful for
   #        ablation without wiring a real IMU prior.
-  default_prior_info: 0.0
+  # >>> ENABLED (5.0) — gives T1 a working prior floor so the degenerate dir is
+  #     not left with zero information when T3 keeps its variance at the prior.
+  default_prior_info: 5.0
 
   # Compute the mask ONCE per frame (before the ESIKF inner iteration loop) and
   # hold it constant across inner iterations. Required by Assumption 1
@@ -64,10 +68,10 @@ dd_esikf:
   # LiDAR has rho→1 and phi→1 (no-op, original behaviour). Under LiDAR
   # degeneracy / failure rho grows, phi grows, R is inflated => the LiDAR
   # contributes less information (doubly suppressed with the directional mask).
-  adaptive_enable: false
+  adaptive_enable: true
   adaptive_alpha: 0.05        # EMA forgetting factor (small => slow adaptation)
   adaptive_phi_min: 1.0       # R scaling floor (never shrink R below nominal)
-  adaptive_phi_max: 20.0      # R scaling ceiling (avoid unbounded inflation)
+  adaptive_phi_max: 10.0      # R scaling ceiling (avoid unbounded inflation)
   adaptive_ramp_thr: 1.5      # rho above which phi starts ramping up
 
   # ---------------------------------------------------------------------------
@@ -77,9 +81,25 @@ dd_esikf:
   # distance information by inflating R (shrinking R_inv) for far points,
   # so the degenerate depth direction is down-weighted and degeneracy
   # detection is sharper. Saturates at far_scale. No-op when enable is false.
-  aniso_enable: false
+  aniso_enable: true
   aniso_far_range: 30.0     # range [m] beyond which R starts inflating
-  aniso_far_scale: 5.0      # max multiplicative inflation of R
+  aniso_far_scale: 3.0      # max multiplicative inflation of R
+
+  # ---------------------------------------------------------------------------
+  # Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) mode. When true, the
+  # 6×6 pose-block information matrix Λ_L and the observation-info vector
+  # H^T R^-1 z are frozen at the FIRST inner iteration's linearization point
+  # and reused every subsequent inner iteration. This removes the fictitious-
+  # observability leak (F5): a re-linearizing ESIKF lets small eigenvalues
+  # drift as H shifts iteration to iteration, injecting spurious information
+  # into weakly-observable directions. FEJ holds the linearization fixed so
+  # the information added per direction is consistent with the first-estimate
+  # geometry. Composes with DD-ESIKF (the mask then operates on the frozen
+  # Λ_L). No-op when false (standard re-linearizing ESIKF).
+  # >>> ENABLED — T4 is the theory highlight (first-estimate Jacobian): freezes
+  #     the 6×6 pose information at the first inner iteration to remove the
+  #     fictitious-observability leak (F5). Composes with T1 (mask on frozen Λ_L).
+  fej_enable: true
 
   # ---------------------------------------------------------------------------
   # Layer 5 (Theorem T5): cross-modal degeneracy-driven visual patch select.

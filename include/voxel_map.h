@@ -254,6 +254,7 @@ public:
   dd_esikf::DegeneracyConfig dd_cfg_;
   std::shared_ptr<dd_esikf::PriorSource> dd_prior_src_;  // IMU/visual prior (optional)
   bool dd_enable_ = false;                              // runtime toggle
+  bool dd_fused_mask_ = true;  // T1: probe on Λ_f = Λ_L + Λ_V (gates Λ_V use)
   // Latest probe result, exposed for diagnostics / plotting.
   dd_esikf::DegeneracyResult dd_last_probe_;
   // Per-frame cache of effective Λ and H^T R^-1 z so inner ESIKF iterations
@@ -271,6 +272,19 @@ public:
   double dd_ada_phi_ = 1.0;   // current R scaling factor for LiDAR
   // ---- Layer 6 (Theorem T6): range-dependent anisotropic LiDAR R. ----
   dd_esikf::AnisoNoiseConfig dd_aniso_cfg_;
+  // ---- Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) mode. ----
+  // When fej_enable is true, the pose-block information matrix Λ_L, the
+  // observation-info vector HTz, AND the prior term (state_propagat - state_)
+  // used in the ESIKF update are all frozen at the FIRST inner iteration's
+  // linearization point and held fixed across inner iterations. This removes
+  // the fictitious-observability leak (F5): a re-linearizing ESIKF lets small
+  // eigenvalues drift as H shifts iteration to iteration, injecting spurious
+  // information into unobservable directions. FEJ holds the linearization
+  // point fixed so the information added per direction is consistent with the
+  // geometry at the first estimate. Cached in fej_*_cached_ at iterCount==0.
+  bool fej_enable_ = false;
+  Eigen::Matrix<double, 6, 6> dd_Lambda_L_cached_ = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> dd_Htz_cached_      = Eigen::Matrix<double, 6, 1>::Zero();
   // Optional file logger for per-frame degeneracy probe (Project A eval).
   std::string dd_log_file_;                          // empty => disabled
   std::ofstream dd_log_;                             // opened in initDegeneracy
