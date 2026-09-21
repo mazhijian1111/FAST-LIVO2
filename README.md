@@ -115,3 +115,9 @@ rosbag play YOUR_DOWNLOADED.bag
 roslaunch fast_livo mapping_avia.launch
 
 rosbag play HKU_Campus.bag
+
+'''
+
+## 6、2026.9.21
+
+mapping_Outdoor04_dd.launch

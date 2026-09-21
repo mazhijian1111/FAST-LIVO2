@@ -631,25 +631,62 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
           (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
 
-      // ---- Layer 3 (Theorem T3): direction-decoupled covariance update on
-      // the 6×6 pose block. Standard (I-G)P falsely contracts the degenerate
-      // direction variance (a small λ_k is treated as information). Instead:
-      //   P_post = Π_obs · P_info · Π_obs  +  Π_deg · P_prior · Π_deg
-      // where P_info = (I-G)P (just computed above) and P_prior = the IMU-
-      // propagated covariance state_propagat.cov. On V_obs, Π_obs=I so the
-      // observable block keeps the standard EKF posterior (T3(iii)); on V_deg,
-      // Π_deg=I so the variance stays at the prior (grows with distance per
-      // IMU Q, never collapses — the long-range consistency guarantee T3(ii)).
-      // Projection lives in the BODY pose frame of dd_last_probe_. ----
+      // ---- Main Theorem (thm:main, P3/P4): direction-decoupled covariance
+      // update on the 6×6 pose block. Standard (I-G)P falsely contracts the
+      // degenerate direction variance (a small λ_k is treated as information).
+      // The main theorem prescribes
+      //   P_post = Π_obs · P_info · Π_obs  +  Π_deg · P_prior_pr · Π_deg
+      // where P_info = (I-G)P (just computed above) and P_prior_pr is the
+      // prior-routed covariance = (P^-)^{-1} + Λ_pr restricted to D
+      // (Lemma lem:t8 / P5: the prior floor keeps the posterior bounded below
+      // by 1/λ_pr). On V_obs, Π_obs=I so the observable block keeps the standard
+      // Fisher-optimal EKF posterior (P2); on V_deg, Π_deg=I so the variance
+      // stays at the prior-routed value (grows with distance per IMU Q, never
+      // collapses — the long-range consistency guarantee P5). Cross blocks
+      // Π_obs·P_post·Π_deg = 0 by construction (P4). Projection lives in the
+      // BODY pose frame of dd_last_probe_. ----
       if (dd_enable_ && dd_last_probe_.has_degeneracy())
       {
         Eigen::Matrix<double, 6, 6> P_info =
             state_.cov.block<6, 6>(0, 0);
+        // Prior-routed covariance on D: P_prior + the prior-information floor.
+        // The constant-information prior Λ_pr = default_prior_info · I_D is
+        // applied as a Schur-complement floor on the degenerate block:
+        //   P_prior_pr|_D = ( (P_prior|_D)^{-1} + Λ_pr|_D )^{-1}
+        // On V_obs the prior is absent (P2), so P_prior_pr|_V_obs = P_prior.
         Eigen::Matrix<double, 6, 6> P_prior =
             state_propagat.cov.block<6, 6>(0, 0);
+        Eigen::Matrix<double, 6, 6> P_prior_pr = P_prior;
+        if (dd_last_probe_.has_degeneracy())
+        {
+          // Apply the constant prior-information floor on the degenerate
+          // subspace only (rem:prior-strict: inject only on D, only after
+          // masking). This is the B3 constant-floor approximation; a real
+          // IMUPreintegrationPrior would replace this block.
+          Eigen::Matrix<double, 6, 6> Lambda_pr_D =
+              dd_last_probe_.Pi_deg * dd_last_probe_.Pi_deg *
+              dd_cfg_.default_prior_info;
+          // Schur-complement prior routing on D:
+          //   P_prior_pr|_D = ( P_prior|_D^{-1} + Λ_pr|_D )^{-1}
+          // Implemented stably as: project to D, add prior info, invert back.
+          Eigen::Matrix<double, 6, 6> P_prior_D =
+              dd_last_probe_.Pi_deg * P_prior * dd_last_probe_.Pi_deg;
+          // Regularize the observable block to avoid singularity, then invert
+          // only the degenerate block.
+          Eigen::Matrix<double, 6, 6> P_prior_D_reg =
+              P_prior_D + dd_last_probe_.Pi_obs * 1e9 *
+                              dd_last_probe_.Pi_obs;  // pin observable block
+          Eigen::Matrix<double, 6, 6> P_prior_pr_D =
+              (P_prior_D_reg.inverse() + Lambda_pr_D).inverse();
+          // Reassemble: observable block from P_prior, degenerate block from
+          // the prior-routed value.
+          P_prior_pr = dd_last_probe_.Pi_obs * P_prior * dd_last_probe_.Pi_obs +
+                       dd_last_probe_.Pi_deg * P_prior_pr_D *
+                           dd_last_probe_.Pi_deg;
+        }
         Eigen::Matrix<double, 6, 6> P_decoupled =
             dd_last_probe_.Pi_obs * P_info * dd_last_probe_.Pi_obs +
-            dd_last_probe_.Pi_deg * P_prior * dd_last_probe_.Pi_deg;
+            dd_last_probe_.Pi_deg * P_prior_pr * dd_last_probe_.Pi_deg;
         state_.cov.block<6, 6>(0, 0) = P_decoupled;
       }
       // total_distance += (_state.pos_end - position_last).norm();

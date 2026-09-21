@@ -363,7 +363,8 @@ void LIVMapper::handleVIO()
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
-}
+std::cout<<"odom: "<<_state.pos_end.transpose()<<std::endl;
+          }
 
 void LIVMapper::handleLIO() 
 {    
