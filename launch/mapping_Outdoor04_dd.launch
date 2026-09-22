@@ -26,6 +26,10 @@
 	<arg name="dd_prior_info" default="0.0" />
 	<arg name="dd_log_file" default="" />
 	<arg name="seq_name" default="Outdoor04_dd" />
+	<!-- Layer 4 (T4 FEJ) and RR-IESKF Axis I (DFEJ) runtime overrides.
+	     dfej takes precedence over fej when both are true (and dd_enable=true). -->
+	<arg name="fej_enable" default="" />
+	<arg name="dfej_enable" default="" />
 
 	<param name="use_sim_time" value="true" />
 
@@ -36,15 +40,32 @@
 	     keys are present for VoxelMapManager::initDegeneracy to read. -->
 	<rosparam command="load" file="$(find fast_livo)/config/dd_esikf.yaml" />
 
+	<!-- Override the evo seq_name so each method writes its own pose file.
+	     IMPORTANT: LIVMapper reads this via a GLOBAL NodeHandle
+	     (main.cpp: ros::NodeHandle nh), so this param must be at launch-file
+	     (global) scope — inside <node> it would land in /laserMapping/evo/*
+	     and never be read. dd_esikf/* inside <node> works the same way ONLY
+	     because initDegeneracy also uses the global nh; but the rosparam
+	     dump shows both ns — keep both scopes consistent here. -->
+	<param name="evo/seq_name"                 value="$(arg seq_name)" />
+	<param name="evo/pose_output_en"           value="true" />
+
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
 		<rosparam file="$(find fast_livo)/config/camera_Outdoor04.yaml" />
-		<!-- Runtime overrides for the comparison sweep (override dd_esikf.yaml) -->
-		<param name="dd_esikf/enable"             value="$(arg dd_enable)" />
-		<param name="dd_esikf/default_prior_info"  value="$(arg dd_prior_info)" />
-		<param name="dd_esikf/log_file"            value="$(arg dd_log_file)" />
-		<!-- Override the evo seq_name so each method writes its own pose file. -->
-		<param name="evo/seq_name"                 value="$(arg seq_name)" />
+		<!-- Runtime overrides for the comparison sweep (override dd_esikf.yaml).
+		     NOTE: these land in /laserMapping/dd_esikf/*, but VoxelMapManager::
+		     initDegeneracy is ALSO given the global nh, and NodeHandle param
+		     lookups resolve relative to the handle's namespace — the global nh
+		     used by main.cpp resolves "dd_esikf/enable" to /dd_esikf/enable.
+		     So ALSO mirror the overrides at global scope below. -->
 	</node>
+
+	<!-- Global-scope mirrors of the runtime overrides (read via the global nh). -->
+	<param name="dd_esikf/enable"              value="$(arg dd_enable)" />
+	<param name="dd_esikf/default_prior_info"  value="$(arg dd_prior_info)" />
+	<param name="dd_esikf/log_file"            value="$(arg dd_log_file)" />
+	<param if="$(eval fej_enable != '')" name="dd_esikf/fej_enable"    value="$(arg fej_enable)" />
+	<param if="$(eval dfej_enable != '')" name="dd_esikf/dfej_enable"  value="$(arg dfej_enable)" />
 
 	<!-- The bag stores the RGB stream as sensor_msgs/CompressedImage. -->
 	<node pkg="image_transport" type="republish" name="outdoor04_image_decompress"

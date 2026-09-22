@@ -285,6 +285,18 @@ public:
   bool fej_enable_ = false;
   Eigen::Matrix<double, 6, 6> dd_Lambda_L_cached_ = Eigen::Matrix<double, 6, 6>::Zero();
   Eigen::Matrix<double, 6, 1> dd_Htz_cached_      = Eigen::Matrix<double, 6, 1>::Zero();
+  // ---- RR-IESKF Axis I (theory.tex eq:dfej / lem:dfej): directional FEJ.
+  // Instead of freezing the WHOLE pose information block (fej_enable_), DFEJ
+  // freezes it ONLY on the degenerate subspace and re-linearizes on the
+  // observable complement each inner iteration:
+  //   Λ_eff   = Π_obs Λ^(i) Π_obs + Π_deg Λ^(0)_eff Π_deg
+  //   HTz_eff = Π_obs HTz^(i)   + Π_deg HTz^(0)_eff
+  // (Λ^(0)_eff = the DD-masked effective info at the first iterate when DD is
+  // on, else the raw first-estimate Λ_L.) The projectors Π_obs/Π_deg come from
+  // dd_last_probe_ (computed at iterCount==0), so DFEJ requires dd_enable_.
+  // The O→D cross-covariance leak (rem:dfej-leak) is blocked by the thm:main
+  // P4 covariance projection, which runs later in the same update. ----
+  bool dfej_enable_ = false;
   // Optional file logger for per-frame degeneracy probe (Project A eval).
   std::string dd_log_file_;                          // empty => disabled
   std::ofstream dd_log_;                             // opened in initDegeneracy

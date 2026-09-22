@@ -102,6 +102,23 @@ dd_esikf:
   fej_enable: true
 
   # ---------------------------------------------------------------------------
+  # RR-IESKF Axis I (theory.tex eq:dfej / lem:dfej): directional FEJ (DFEJ).
+  # Requires dd_esikf/enable: true. Freezes the pose information block ONLY on
+  # the degenerate subspace Π_deg and re-linearizes on the observable
+  # complement Π_obs at every inner iteration:
+  #   Λ_eff^(i) = Π_obs Λ^(i) Π_obs + Π_deg Λ_eff^(0) Π_deg
+  # (D1) on D this equals whole-frame FEJ — the fictitious-observability leak
+  #      stays blocked (the frozen D-block cannot drift as H re-linearizes);
+  # (D2) on O the fresh re-linearized H^(i) keeps first-order Fisher
+  #      optimality across inner iterations, which whole-frame FEJ sacrifices;
+  # (D3) DFEJ is no-worse-than FEJ pointwise.
+  # The O→D cross-covariance leak (rem:dfej-leak) is severed by the thm:main
+  # P4 covariance projection, which runs in the same update. When BOTH
+  # fej_enable and dfej_enable are true, DFEJ takes precedence: the O-block
+  # stays fresh while the D-block is frozen by the DD cache.
+  dfej_enable: false
+
+  # ---------------------------------------------------------------------------
   # Layer 5 (Theorem T5): cross-modal degeneracy-driven visual patch select.
   # Scores each visual patch by the trace of its pose-information projected
   # onto the LiDAR degenerate projector Π_deg, then greedily selects a budget
