@@ -119,6 +119,30 @@ dd_esikf:
   dfej_enable: false
 
   # ---------------------------------------------------------------------------
+  # RR-IESKF freeze threshold (theory.tex thm:residual / cor:tilt-resolution).
+  # 0.0 => legacy absolute criterion (λ_min < lio/min_eigen_value).
+  # >0   => scale-relative tilt criterion: accept a plane iff
+  #         λ_min/λ_mid < tilt_tau². This is the θ²_tilt of the theory: a
+  #         TILT threshold, not an information threshold — it decides whether
+  #         the residual structure exceeds the map's own plane-fit precision
+  #         (θ²_tilt = ⟨λ_min/λ_mid⟩_w ~ σ_pt/(L·√w)) rather than whether the
+  #         information is numerically small (rem:which-floor).
+  tilt_tau: 0.0
+
+  # ---------------------------------------------------------------------------
+  # RR-IESKF Axis II (theory.tex sec:gate-optimal / prop:gate-optimal):
+  # optimal reliability gate on the VISUAL information block Λ_V. Params live
+  # under `vio:` in the base config (vio/gate_enable, vio/gate_C,
+  # vio/gate_nu_alpha). The gate is the cost-optimal hyperbola
+  #   u* = min(1, 1/(2C b̂² λ_V − η)),   b̂² = max(nu−1, 0) (plug-in read),
+  # applied as Λ_V → u² Λ_V before the fused-mask probe and inside the VIO
+  # update. At consistency (nu ≤ 1) u = 1: exactly the plain sum, no loss
+  # (G1 / rem:route-vs-sum). DOMAIN (prop:common-mode M5): covers
+  # per-modality degradation; provably inert to a steady common-mode
+  # (extrinsic) bias — see rem:common-meaning for the anchor alternative.
+  # No separate switch here; set vio/gate_enable: true in the base config.
+
+  # ---------------------------------------------------------------------------
   # Layer 5 (Theorem T5): cross-modal degeneracy-driven visual patch select.
   # Scores each visual patch by the trace of its pose-information projected
   # onto the LiDAR degenerate projector Π_deg, then greedily selects a budget

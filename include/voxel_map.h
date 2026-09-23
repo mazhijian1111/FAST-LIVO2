@@ -297,6 +297,18 @@ public:
   // The O→D cross-covariance leak (rem:dfej-leak) is blocked by the thm:main
   // P4 covariance projection, which runs later in the same update. ----
   bool dfej_enable_ = false;
+  // Scale-relative plane acceptance (thm:residual / cor:tilt-resolution).
+  // VoxelOctoTree::init_plane is a free-standing class without access to the
+  // manager's config, so the tilt threshold is relayed through a static
+  // set once at init (initDegeneracy). 0.0 => legacy absolute
+  // planer_threshold_; >0 => λ_min/λ_mid < tilt_tau².
+  double tilt_tau_ = 0.0;
+  static double & s_tilt_tau()
+  {
+    static double v = 0.0;
+    return v;
+  }
+  static double tilt_tau_global() { return s_tilt_tau(); }
   // Optional file logger for per-frame degeneracy probe (Project A eval).
   std::string dd_log_file_;                          // empty => disabled
   std::ofstream dd_log_;                             // opened in initDegeneracy

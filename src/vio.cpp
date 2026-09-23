@@ -1768,6 +1768,41 @@ void VIOManager::updateState(cv::Mat img, int level)
       }
 
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
+      // ---- RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate.
+      // The photometric residual energy is the NIS proxy
+      //   nu = mean_j r_j² / img_point_cov,
+      // whose EMA is the plug-in read's signal: b̂² ≈ (nu − 1) (per-pixel,
+      // prop:bias-read B1; the additive floor 1/(λ_f+2π) is inside the EMA's
+      // noise, not bias-corrected here). The cost-optimal gate (G2/G5) is the
+      // hyperbola
+      //   u* = min(1, 1 / (2 C b̂² λ_V − η)),   η = λ_V / (λ_L + π),
+      // with λ_V, λ_L the per-frame information SCALES tr(Λ)/6 and π the
+      // prior scale tr(P^-)^{-1}/6 approximated by 1/img_point_cov. The gate
+      // multiplies the visual pose information by u² (eq:gated-update's
+      // w_V²λ_V with w_V = u, w_L = 1). At nu ≤ 1 (consistent) u = 1 and
+      // this is EXACTLY the plain sum (rem:route-vs-sum: no loss in the
+      // unbiased regime). No-op when gate_enable is false.
+      if (gate_enable && n_meas > 0)
+      {
+        // Plug-in read: mean residual energy in noise-units, clamped at the
+        // consistent value (B1: the read is frequently negative frame-wise).
+        const double nu_inst = error / std::max(1e-9, (double)n_meas) / img_point_cov;
+        gate_nu_V = (1.0 - gate_nu_alpha) * gate_nu_V + gate_nu_alpha * nu_inst;
+        // Per-frame information scales.
+        const double lam_V = std::max(last_Lambda_V.trace() / 6.0, 1e-9);
+        gate_lambda_V = 0.9 * gate_lambda_V + 0.1 * lam_V;
+        const double lam_L = gate_lambda_L_valid
+                                 ? std::max(gate_lambda_L, 1e-9)
+                                 : 10.0 * gate_lambda_V;  // fallback: LiDAR ≫ visual
+        const double pi_pr = 1.0 / std::max(img_point_cov, 1e-9);
+        // Optimal gate (eq:gate-optimal): b̂² = max(nu − 1, 0).
+        const double b2 = std::max(gate_nu_V - 1.0, 0.0);
+        const double eta = gate_lambda_V / (lam_L + pi_pr);
+        const double denom = 2.0 * gate_C * b2 * gate_lambda_V - eta;
+        gate_u_V = (denom > 0.0) ? std::min(1.0, 1.0 / denom) : 1.0;
+        // Apply the gate: scale the visual pose information by u².
+        H_T_H.block<6, 6>(0, 0) *= (gate_u_V * gate_u_V);
+      }
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       auto &&HTz = H_sub_T * z;
       // ---- P2 fused-mask: cache the VIO pose information block (6×6 + 6×1)

@@ -156,6 +156,28 @@ public:
   Eigen::Matrix<double, 6, 1> last_b_V      = Eigen::Matrix<double, 6, 1>::Zero();
   bool last_V_valid = false;
 
+  // ---- RR-IESKF Axis II (theory.tex sec:gate-optimal / prop:gate-optimal):
+  // optimal per-modality reliability gate. Replaces the shipped consistency
+  // ramp clip(1 - nu/kappa, 0, 1) by the cost-optimal hyperbola (G5):
+  //   u* = min(1, 1 / (2 C b̂² λ_L − η)),   η = λ_L/(λ_V + π),
+  // driven by the plug-in bias read b̂²_m = ⟨r_m²⟩ − 1/λ_m (prop:bias-read
+  // B1/B2: its floor is the filter's own error variance — clamp at 0).
+  // The gate multiplies the VISUAL pose information block by u² (the suspect
+  // modality here is V; LiDAR is the reference). rem:common-meaning records
+  // the domain: the gate covers per-modality degradation and is provably
+  // inert to a steady common-mode (extrinsic) bias (prop:common-mode M5).
+  bool   gate_enable   = false;   // master switch (vio/gate_enable)
+  double gate_C        = 1.0;     // c_bias / c_var cost ratio (vio/gate_C)
+  double gate_kappa    = 4.0;     // shipped-ramp threshold, kept for the log
+  // EMA of the NIS proxy: mean photometric residual energy, in units of the
+  // nominal per-pixel variance (img_point_cov). nu=1 ⇔ consistent (T2).
+  double gate_nu_V     = 1.0;     // EMA of r^2 / img_point_cov (plug-in read + 1)
+  double gate_nu_alpha = 0.05;    // EMA forgetting factor
+  double gate_u_V      = 1.0;     // current gate factor on Λ_V (diagnostics)
+  double gate_lambda_V = 1.0;     // scale of Λ_V: tr(Λ_V)/6, EMA-smoothed
+  double gate_lambda_L = 1.0;     // scale of Λ_L from LIO: tr(Λ_L)/6 (set by LIVMapper)
+  bool   gate_lambda_L_valid = false;
+
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;
   unordered_map<VOXEL_LOCATION, int> sub_feat_map; 

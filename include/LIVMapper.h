@@ -133,6 +133,10 @@ public:
   bool   robust_vio_enable = false;
   double robust_vio_nu     = 3.0;
   double robust_vio_alpha  = 0.1;
+  // RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate params.
+  bool   vio_gate_enable   = false;
+  double vio_gate_C        = 1.0;
+  double vio_gate_nu_alpha = 0.05;
   // Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
   bool   cross_modal_select_enable = false;
   int    cross_modal_budget        = -1;

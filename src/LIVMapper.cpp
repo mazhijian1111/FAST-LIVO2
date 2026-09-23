@@ -76,6 +76,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   // Layer 5 (Theorem T5): cross-modal degeneracy-driven patch select.
   nh.param<bool>  ("vio/cross_modal_select_enable", cross_modal_select_enable, false);
   nh.param<int>   ("vio/cross_modal_budget",        cross_modal_budget,        -1);
+  // RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate on Λ_V.
+  nh.param<bool>  ("vio/gate_enable",    vio_gate_enable,    false);
+  nh.param<double>("vio/gate_C",         vio_gate_C,         1.0);
+  nh.param<double>("vio/gate_nu_alpha",  vio_gate_nu_alpha,  0.05);
 
   nh.param<double>("time_offset/exposure_time_init", exposure_time_init, 0.0);
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
@@ -160,6 +164,10 @@ void LIVMapper::initializeComponents()
   vio_manager->robust_vio_sigma2 = (double)IMG_POINT_COV;  // init from nominal cov
   vio_manager->cross_modal_select_enable = cross_modal_select_enable;
   vio_manager->cross_modal_budget        = cross_modal_budget;
+  // RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate.
+  vio_manager->gate_enable   = vio_gate_enable;
+  vio_manager->gate_C        = vio_gate_C;
+  vio_manager->gate_nu_alpha = vio_gate_nu_alpha;
   vio_manager->colmap_output_en = colmap_output_en;
   vio_manager->initializeVIO();
 
@@ -334,6 +342,21 @@ void LIVMapper::handleVIO()
     vio_manager->lio_Pi_deg_valid = false;
   }
 
+  // RR-IESKF Axis II (prop:gate-optimal): push the LiDAR information scale
+  // tr(Λ_L)/6 into the VIO gate so η = λ_V/(λ_L+π) uses the real LiDAR
+  // magnitude (G3: the gate boundary must not depend on a λ_L guess).
+  if (voxelmap_manager->dd_enable_)
+  {
+    // Use the last DD-cached effective Λ (post-mask, the information the LIO
+    // update actually used); fall back to zero if the cache is not yet filled.
+    const Eigen::Matrix<double,6,6>& Leff = voxelmap_manager->dd_Lambda_eff_cached_;
+    if (!Leff.isZero(1e-12))
+    {
+      vio_manager->gate_lambda_L = Leff.trace() / 6.0;
+      vio_manager->gate_lambda_L_valid = true;
+    }
+  }
+
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
   if (imu_prop_enable) 
@@ -405,7 +428,15 @@ void LIVMapper::handleLIO()
   // Λ_V is one VIO frame stale (LIO/VIO run at different timestamps); a
   // slow-motion approximation, documented in degeneracy.h.
   if (vio_manager->last_V_valid)
-    voxelmap_manager->setVisualInfo(vio_manager->last_Lambda_V, true);
+  {
+    // RR-IESKF Axis II (prop:gate-optimal): apply the reliability gate to Λ_V
+    // BEFORE the fused-mask probe consumes it, so the probed fused information
+    // Λ_f = Λ_L + u²Λ_V reflects the gated visual information (the gated Λ_V
+    // is also what the mask semantics require: only trusted visual info may
+    // shrink the degenerate subspace, Theorem T1(iii)).
+    voxelmap_manager->setVisualInfo(
+        vio_manager->last_Lambda_V * (vio_manager->gate_u_V * vio_manager->gate_u_V), true);
+  }
 
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;

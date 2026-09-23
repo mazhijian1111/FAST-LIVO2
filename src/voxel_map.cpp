@@ -74,6 +74,18 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
   nh.param<double>("dd_esikf/aniso_far_scale", dd_aniso_cfg_.far_scale,    5.0);
   // Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) mode.
   nh.param<bool>  ("dd_esikf/fej_enable",      fej_enable_,                false);
+  // RR-IESKF Axis I (theory.tex lem:dfej / thm:dfej-nees): directional FEJ.
+  // Requires dd_esikf/enable: true (it uses the probe's projectors). Freezes
+  // the pose information ONLY on Π_deg, re-linearizes on Π_obs. NOTE: the
+  // gain must keep the outer-product structure K·h^T (rem:coupled-check) —
+  // a diagonal-in-eigenbasis gain silently corrupts the O←D leak channel.
+  nh.param<bool>  ("dd_esikf/dfej_enable",     dfej_enable_,               false);
+  // Scale-relative plane acceptance (theory.tex thm:residual /
+  // cor:tilt-resolution). 0.0 ⇒ legacy absolute min_eigen_value criterion;
+  // >0 ⇒ accept iff λ_min/λ_mid < tilt_tau² (a tilt threshold, not an
+  // information threshold).
+  nh.param<double>("dd_esikf/tilt_tau",        tilt_tau_,                  0.0);
+  s_tilt_tau() = tilt_tau_;  // relay to VoxelOctoTree::init_plane (static)
   // dd_prior_src_ is wired by LIVMapper (which owns the IMU/visual state),
   // not here, since VoxelMapManager has no direct IMU preintegration handle.
 
@@ -130,7 +142,35 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
   J_Q << 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_;
   // && evalsReal(evalsMid) > 0.05
   //&& evalsReal(evalsMid) > 0.01
-  if (evalsReal(evalsMin) < planer_threshold_)
+  // ---- RR-IESKF freeze threshold (theory.tex thm:residual /
+  // prop:freeze-threshold / cor:tilt-resolution): SCALE-RELATIVE acceptance.
+  // The absolute criterion λ_min < planer_threshold_ conflates two failure
+  // modes: a plane can have a small λ_min because it is degenerate (the
+  // map's frozen plane-fitting error looks like real grazing geometry) or
+  // because the scene's tilt θ_tilt exceeds the plane-fit resolution. The
+  // tilt criterion replaces the absolute threshold by the ratio
+  //   θ²_tilt = λ_min / λ_mid,
+  // the scale-relative quantity whose prediction from the map's plane
+  // inventory is θ²_tilt = ⟨λ_min/λ_mid⟩_w (per-frame, parameter-free,
+  // scaling as σ_pt/(L·√w)). A direction is accepted as a plane iff its
+  // tilt is BELOW the map's own resolution, i.e. iff the residual structure
+  // is not distinguishable from the fit noise:
+  //   λ_min/λ_mid < tau_tilt²   (default 0 ⇒ legacy absolute criterion).
+  // With tau_tilt > 0 the decision is a TILT threshold rather than an
+  // information threshold (rem:which-floor: a mismatched absolute floor
+  // diagnoses residual degeneracy, not numerical degeneracy).
+  bool plane_accept;
+  if (VoxelMapManager::tilt_tau_global() > 0.0)
+  {
+    const double lam_min = evalsReal(evalsMin);
+    const double lam_mid = evalsReal(evalsMid);
+    plane_accept = (lam_min / std::max(lam_mid, 1e-12)) < (VoxelMapManager::tilt_tau_global() * VoxelMapManager::tilt_tau_global());
+  }
+  else
+  {
+    plane_accept = evalsReal(evalsMin) < planer_threshold_;
+  }
+  if (plane_accept)
   {
     for (int i = 0; i < points.size(); i++)
     {
@@ -597,7 +637,45 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       H_T_H.block<6, 6>(0, 0) = dd_Lambda_eff_cached_;
       for (int i = 0; i < 6; ++i) HTz(i) = dd_Htz_eff_cached_(i);
     }
-    // ---- end DD-ESIKF -------------------------------------------------
+
+    // ---- RR-IESKF Axis I (theory.tex eq:dfej / lem:dfej / thm:dfej-nees):
+    // directional FEJ (DFEJ). Whole-frame FEJ (fej_enable_ above) freezes the
+    // ENTIRE pose information block, which removes the fictitious-observability
+    // leak on D but sacrifices Fisher optimality on O (thm:fej-obias: the
+    // frozen-observable-block bias is quadratic in the inner-iteration
+    // displacement). DFEJ composes the best of both:
+    //   Λ_used^(i) = Π_obs Λ^(i) Π_obs + Π_deg Λ^(0)_eff Π_deg
+    //   HTz_used^(i) = Π_obs HTz^(i) + Π_deg HTz^(0)_eff
+    // where Λ^(0)_eff / HTz^(0)_eff are the DD-masked effective quantities of
+    // the FIRST inner iteration (dd_Lambda_eff_cached_ / dd_Htz_eff_cached_).
+    // (D1) on D this equals whole-frame FEJ — the frozen D-block cannot drift
+    //      as H re-linearizes, so the leak stays blocked;
+    // (D2) on O the fresh re-linearized H^(i) keeps first-order Fisher
+    //      optimality across inner iterations;
+    // (D3) DFEJ is no-worse-than FEJ pointwise (thm:dfej-nees C1/C2, verified
+    //      numerically in sec:coupled: DFEJ NEES = 1 for every frozen-block
+    //      bias, plain converges to the closed-form bias fixed point).
+    // Requires the probe's projectors, hence dd_enable_; when both switches
+    // are on, DFEJ takes precedence (the code below simply re-imposes the
+    // Π_obs part of the fresh iterate on top of whatever FEJ/DD produced).
+    if (dfej_enable_ && dd_enable_)
+    {
+      const Eigen::Matrix<double, 6, 6>& Pi_obs = dd_last_probe_.Pi_obs;
+      const Eigen::Matrix<double, 6, 6>& Pi_deg = dd_last_probe_.Pi_deg;
+      // Fresh (this-iterate) pose quantities, after FEJ/DD substitution above.
+      Eigen::Matrix<double, 6, 6> Lambda_fresh = H_T_H.block<6, 6>(0, 0);
+      Eigen::Matrix<double, 6, 1> HTz_fresh    = HTz.head<6>();
+      // Frozen first-estimate effective quantities.
+      Eigen::Matrix<double, 6, 6> Lambda_frozen = fej_enable_
+          ? dd_Lambda_eff_cached_          // FEJ ran: cache is the frozen effective Λ
+          : dd_Lambda_eff_cached_;         // DD-only: same cache (iter-0 effective)
+      Eigen::Matrix<double, 6, 1> HTz_frozen = dd_Htz_eff_cached_;
+      // Π_obs ← fresh, Π_deg ← frozen (lem:dfej).
+      H_T_H.block<6, 6>(0, 0) = Pi_obs * Lambda_fresh * Pi_obs +
+                                Pi_deg * Lambda_frozen * Pi_deg;
+      HTz.head<6>() = Pi_obs * HTz_fresh + Pi_deg * HTz_frozen;
+    }
+    // ---- end DFEJ -------------------------------------------------------
 
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
