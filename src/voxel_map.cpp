@@ -62,6 +62,15 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
   nh.param<bool>  ("dd_esikf/hard_mask",        dd_cfg_.hard_mask,         false);
   nh.param<double>("dd_esikf/default_prior_info", dd_cfg_.default_prior_info, 0.0);
   nh.param<bool>  ("dd_esikf/per_frame_mask",   dd_cfg_.per_frame_mask,   true);
+  // ---- Whitened criterion (§2.2). When whiten_enable is true the degeneracy
+  // criterion runs on W = S Λ_f S, S = (P^-)^{1/2}, so the thresholds are
+  // DIMENSIONLESS (units of prior information) and the whole verdict is
+  // invariant under error reparametrization. The prior covariance is supplied
+  // per frame from the propagated state covariance; until it is, the probe
+  // silently stays on the raw criterion (prior_cov_present == false).
+  nh.param<bool>  ("dd_esikf/whiten_enable",    dd_cfg_.whiten_enable,     false);
+  nh.param<double>("dd_esikf/tau_w_abs",        dd_cfg_.whiten.tau_w_abs,  0.25);
+  nh.param<double>("dd_esikf/tau_w_rel",        dd_cfg_.whiten.tau_w_rel,  1e-3);
   // Layer 2 (Theorem T2): NIS-based adaptive LiDAR measurement noise.
   nh.param<bool>  ("dd_esikf/adaptive_enable",  dd_ada_cfg_.enable,        false);
   nh.param<double>("dd_esikf/adaptive_alpha",   dd_ada_cfg_.alpha,         0.05);
@@ -104,6 +113,26 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
   // directions the IMU prior does not cover. The wiring itself is in
   // LIVMapper::handleLIO (it owns the IMU handle). ----
   nh.param<bool>  ("dd_esikf/imu_prior_enable", imu_prior_enable_,        false);
+  // ---- Map-write gating (research task "地图写入门控"): break the pollution
+  // feedback loop at the WRITE step. Points whose converged residual exceeds
+  // map_gate_residual_ are refused from the voxel map; under detected
+  // degeneracy the surviving writes are thinned by (1 + deg_rank *
+  // map_gate_deg_thin_) so a drifting segment pollutes at a lower rate.
+  // No-op when map_gate_enable is false (default keeps original behavior).
+  nh.param<bool>  ("dd_esikf/map_gate_enable",   map_gate_enable_,   false);
+  nh.param<double>("dd_esikf/map_gate_residual", map_gate_residual_, 0.20);
+  nh.param<int>   ("dd_esikf/map_gate_deg_thin", map_gate_deg_thin_, 1);
+  // Alternating DD sweeps (prop:comp-iterate): re-run the inner ESIKF loop
+  // from the updated posterior when coupled degeneracy persists, up to
+  // comp_sweep_max passes, until the pose correction is below comp_sweep_tol.
+  nh.param<bool>   ("dd_esikf/comp_sweep_enable", comp_sweep_enable_, false);
+  nh.param<int>    ("dd_esikf/comp_sweep_max",    comp_sweep_max_,    2);
+  nh.param<double> ("dd_esikf/comp_sweep_tol",    comp_sweep_tol_,    1e-3);
+  // Submap stage 1 (research task "子图化"): time-aware eviction of stale
+  // out-of-window submaps on top of the geometric sliding window.
+  nh.param<bool>   ("dd_esikf/submap_enable",     submap_enable_,     false);
+  nh.param<int>    ("dd_esikf/submap_period",     submap_period_,     50);
+  nh.param<int>    ("dd_esikf/submap_evict_stale", submap_evict_stale_, 500);
   // dd_prior_src_ is wired by LIVMapper (which owns the IMU/visual state),
   // not here, since VoxelMapManager has no direct IMU preintegration handle.
 
@@ -120,7 +149,7 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
     {
       dd_log_ << "# DD-ESIKF probe log\n"
               << "# frame  lambda1..6  m1..6  deg_rank  v_deg_pos(3) v_obs_pos(3) "
-              << "last_lio_update_time\n";
+              << "tau_eff\n";
     }
     else
     {
@@ -474,7 +503,37 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   I_STATE.setIdentity();
 
   bool flg_EKF_inited, flg_EKF_converged, EKF_stop_flg = 0;
-  for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
+
+  // ---- Alternating DD sweeps (theory.tex prop:comp-iterate) ----------------
+  // Outer block Gauss-Newton loop. Sweep 0 is the stock k=1 pass (identical
+  // behavior when comp_sweep_enable_ is false — the loop below then runs
+  // exactly once and the residual/termination logic is untouched). A second
+  // sweep re-linearizes BOTH the DD probe and the plane matches at the
+  // posterior of the previous sweep, per prop:comp-iterate's "re-linearizing
+  // each block at the state produced by the previous sweep". Sweeps only
+  // repeat under COUPLED degeneracy (probe degenerate + visual info present),
+  // the regime where thm:comp-gap's re-linearization deficit lives.
+  int sweep = 0;
+  Eigen::Matrix<double, 6, 1> prev_pose_corr = Eigen::Matrix<double, 6, 1>::Constant(
+      comp_sweep_tol_ * 10.0);  // forces at least one second sweep attempt
+  for (; sweep < (comp_sweep_enable_ ? comp_sweep_max_ : 1); ++sweep)
+  {
+    // Sweep > 0: re-linearize at the updated posterior. The prior anchor
+    // state_propagat stays fixed (it IS the prior of the joint MAP cost);
+    // only the linearization state_ moved.
+    if (sweep > 0)
+    {
+      // Coupled-degeneracy gate: no point re-sweeping when the probe is
+      // healthy (fixed point already reached to first order) or when there
+      // is no visual block to alternate against.
+      if (!dd_last_probe_.has_degeneracy() || !dd_Lambda_V_valid_) break;
+      // Convergence of the previous sweep's correction: block Gauss-Newton
+      // has hit the joint fixed point within tolerance — stop.
+      if (prev_pose_corr.norm() < comp_sweep_tol_) break;
+      EKF_stop_flg = false;
+      rematch_num = 0;
+    }
+    for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
   {
     double total_residual = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr world_lidar(new pcl::PointCloud<pcl::PointXYZI>);
@@ -652,12 +711,41 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       dd_in.Lambda_V = (dd_fused_mask_ && dd_Lambda_V_valid_)
                            ? dd_Lambda_V_
                            : Eigen::Matrix<double, 6, 6>::Zero();
+      // §2.2 whitening prior: P^-, the propagated POSE-block covariance at this
+      // frame. Same 6×6 block the ESIKF prior term uses, so the whitened
+      // threshold is referenced to exactly the information the update already
+      // has — not to an arbitrary eigenvalue scale. When whiten_enable is off
+      // this is ignored (prior_cov_present stays false).
+      //
+      // It is the COVARIANCE, and that choice is load-bearing: S = (P^-)^{1/2}
+      // is the matrix that makes the error coordinates ξ̃ = S^{-1}ξ prior-unit, so
+      // w_k = σ_prior(k)·λ_k is a dimensionless information ratio. On real
+      // Outdoor04 this is what keeps w_k in the range the thresholds were chosen
+      // for — a run with whiten_enable:true and a real P^- gives w_min ~ 3.0e5 at
+      // the median (WHITEN_smoke_r1/probe.log, 2364 frames) and fires on ~1 frame
+      // in 800. Passing an INFORMATION matrix (or a mis-scaled P) here instead
+      // gives w spanning 1e-5…1e20 and makes the criterion degenerate: "prior-
+      // degenerate" then means "the sensor's information is below the prior's"
+      // only if the two are in the same units, which is the whole point.
+      if (dd_cfg_.whiten_enable)
+      {
+        dd_cfg_.prior_cov = state_propagat.cov.block<6, 6>(0, 0);
+        dd_cfg_.prior_cov = 0.5 * (dd_cfg_.prior_cov + dd_cfg_.prior_cov.transpose());
+        dd_cfg_.prior_cov_present = true;
+      }
       auto dd_out = dd_esikf::applyToESIKF(dd_in, dd_cfg_, dd_prior_src_.get());
       dd_last_probe_ = dd_out.probe_res;
       // Cache the effective quantities in frame-local storage so inner
       // iterations reuse them (per_frame_mask contract).
       dd_Lambda_eff_cached_ = dd_out.Lambda_eff;
       dd_Htz_eff_cached_    = dd_out.Htz_eff;
+      // §2.2: the whitened-coordinate projectors, cached for the covariance
+      // path. The covariance projection is the ONLY place the whitened mode
+      // needs a coordinate change: it runs on the ξ̃-space prior covariance
+      // P̃ = S^{-1} P S^{-1}, where the standard theorem applies verbatim, and
+      // the result is mapped back with P = S P̃ S.
+      dd_Pi_obs_tilde_cached_ = dd_out.Pi_obs_tilde;
+      dd_Pi_deg_tilde_cached_ = dd_out.Pi_deg_tilde;
     }
     if (dd_enable_)
     {
@@ -695,10 +783,10 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // term of lem:dfej: re-linearized information on O, frozen on D.
       const Eigen::Matrix<double, 6, 6>& Lambda_fresh = Lambda_iter;
       const Eigen::Matrix<double, 6, 1>& HTz_fresh    = HTz_iter;
-      // Frozen first-estimate effective quantities.
-      Eigen::Matrix<double, 6, 6> Lambda_frozen = fej_enable_
-          ? dd_Lambda_eff_cached_          // FEJ ran: cache is the frozen effective Λ
-          : dd_Lambda_eff_cached_;         // DD-only: same cache (iter-0 effective)
+      // Frozen first-estimate effective quantities. With or without FEJ, the
+      // iter-0 DD cache holds the same effective quantities (FEJ freezes the
+      // raw Λ at iter 0, then the DD block masks it in-place), so one source.
+      Eigen::Matrix<double, 6, 6> Lambda_frozen = dd_Lambda_eff_cached_;
       Eigen::Matrix<double, 6, 1> HTz_frozen = dd_Htz_eff_cached_;
       // Π_obs ← fresh, Π_deg ← frozen (lem:dfej).
       H_T_H.block<6, 6>(0, 0) = Pi_obs * Lambda_fresh * Pi_obs +
@@ -782,49 +870,84 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // collapses — the long-range consistency guarantee P5). Cross blocks
       // Π_obs·P_post·Π_deg = 0 by construction (P4). Projection lives in the
       // BODY pose frame of dd_last_probe_. ----
+      //
+      // ---- §2.2 whitened mode: SAME theorem, ξ̃ coordinates ----------------
+      // When the probe ran on W = S Λ_f S, D = {k : w_k < τ_w} is a subspace of
+      // ξ̃ = S^{-1}ξ and Π_ξ = S Π̃ S^{-1} is NOT symmetric — plugging it into
+      // the expressions above would be a mistake (ill-scaled: with the 3
+      // translational directions degenerate, ‖M_ξ‖ = ‖S^{-1}M̃S‖ = 1.7e0 here,
+      // because S mixes the 5e-4 rad attitude scale with the 1e-2 m position
+      // scale). Instead map the COVARIANCE into ξ̃, where the theorem holds
+      // verbatim with the symmetric Π̃:
+      //     P̃ = S^{-1} P S^{-1}        (inverse congruence, PSD-preserving)
+      //     P̃_post = Π̃_obs P̃_info Π̃_obs + Π̃_deg P̃_pr Π̃_deg
+      //     P_post = S P̃_post S         (congruence back)
+      // The observable subspace is the SAME in both coordinates — only the
+      // basis changed — so this is a re-basing of the projection, not a second
+      // criterion. The prior floor is a whitened quantity in this mode:
+      // λ_pr = τ_w_abs, i.e. "the prior keeps exactly what the threshold treats
+      // as the information floor" (the raw mode's default_prior_info stays the
+      // raw path's floor). That choice is what makes the two paths agree on the
+      // degenerate block: P̃_prior_pr = ((P̃_prior)^{-1} + λ_pr Π̃_deg)^{-1} and
+      // in our coordinates P̃_prior = I, so P̃_pr = (1+λ_pr)^{-1} on D — the
+      // posterior variance on D is held at 1/2 of the prior, never below.
       if (dd_enable_ && dd_last_probe_.has_degeneracy())
       {
-        Eigen::Matrix<double, 6, 6> P_info =
-            state_.cov.block<6, 6>(0, 0);
-        // Prior-routed covariance on D: P_prior + the prior-information floor.
-        // The constant-information prior Λ_pr = default_prior_info · I_D is
-        // applied as a Schur-complement floor on the degenerate block:
-        //   P_prior_pr|_D = ( (P_prior|_D)^{-1} + Λ_pr|_D )^{-1}
-        // On V_obs the prior is absent (P2), so P_prior_pr|_V_obs = P_prior.
-        Eigen::Matrix<double, 6, 6> P_prior =
-            state_propagat.cov.block<6, 6>(0, 0);
+        const bool wmode = dd_last_probe_.tau_whitened;
+        const auto& S    = dd_last_probe_.whiten_S;
+        const auto& Sinv = dd_last_probe_.whiten_S_inv;
+        // Projectors: whitened-coordinate ones in whitened mode, ξ-space body
+        // frame otherwise. `P_info`/`P_prior` are read in the same coordinates.
+        // Materialized explicitly: the two branches are different Eigen
+        // expression types, so a `?:` on them will not compile.
+        Eigen::Matrix<double, 6, 6> Proj_obs, Proj_deg;
+        Eigen::Matrix<double, 6, 6> P_info, P_prior;
+        if (wmode)
+        {
+          Proj_obs = dd_Pi_obs_tilde_cached_;
+          Proj_deg = dd_Pi_deg_tilde_cached_;
+          P_info   = Sinv * state_.cov.block<6, 6>(0, 0) * Sinv;
+          P_prior  = Sinv * state_propagat.cov.block<6, 6>(0, 0) * Sinv;
+        }
+        else
+        {
+          Proj_obs = dd_last_probe_.Pi_obs;
+          Proj_deg = dd_last_probe_.Pi_deg;
+          P_info   = state_.cov.block<6, 6>(0, 0);
+          P_prior  = state_propagat.cov.block<6, 6>(0, 0);
+        }
+        P_info  = 0.5 * (P_info + P_info.transpose());
+        P_prior = 0.5 * (P_prior + P_prior.transpose());
+        const double prior_info_floor =
+            wmode ? dd_cfg_.whiten.tau_w_abs : dd_cfg_.default_prior_info;
         Eigen::Matrix<double, 6, 6> P_prior_pr = P_prior;
-        if (dd_last_probe_.has_degeneracy())
         {
           // Apply the constant prior-information floor on the degenerate
           // subspace only (rem:prior-strict: inject only on D, only after
           // masking). This is the B3 constant-floor approximation; a real
           // IMUPreintegrationPrior would replace this block.
           Eigen::Matrix<double, 6, 6> Lambda_pr_D =
-              dd_last_probe_.Pi_deg * dd_last_probe_.Pi_deg *
-              dd_cfg_.default_prior_info;
+              Proj_deg * Proj_deg * prior_info_floor;
           // Schur-complement prior routing on D:
           //   P_prior_pr|_D = ( P_prior|_D^{-1} + Λ_pr|_D )^{-1}
           // Implemented stably as: project to D, add prior info, invert back.
-          Eigen::Matrix<double, 6, 6> P_prior_D =
-              dd_last_probe_.Pi_deg * P_prior * dd_last_probe_.Pi_deg;
+          Eigen::Matrix<double, 6, 6> P_prior_D = Proj_deg * P_prior * Proj_deg;
           // Regularize the observable block to avoid singularity, then invert
           // only the degenerate block.
           Eigen::Matrix<double, 6, 6> P_prior_D_reg =
-              P_prior_D + dd_last_probe_.Pi_obs * 1e9 *
-                              dd_last_probe_.Pi_obs;  // pin observable block
+              P_prior_D + Proj_obs * 1e9 * Proj_obs;  // pin observable block
           Eigen::Matrix<double, 6, 6> P_prior_pr_D =
               (P_prior_D_reg.inverse() + Lambda_pr_D).inverse();
           // Reassemble: observable block from P_prior, degenerate block from
           // the prior-routed value.
-          P_prior_pr = dd_last_probe_.Pi_obs * P_prior * dd_last_probe_.Pi_obs +
-                       dd_last_probe_.Pi_deg * P_prior_pr_D *
-                           dd_last_probe_.Pi_deg;
+          P_prior_pr = Proj_obs * P_prior * Proj_obs +
+                       Proj_deg * P_prior_pr_D * Proj_deg;
         }
         Eigen::Matrix<double, 6, 6> P_decoupled =
-            dd_last_probe_.Pi_obs * P_info * dd_last_probe_.Pi_obs +
-            dd_last_probe_.Pi_deg * P_prior_pr * dd_last_probe_.Pi_deg;
-        state_.cov.block<6, 6>(0, 0) = P_decoupled;
+            Proj_obs * P_info * Proj_obs + Proj_deg * P_prior_pr * Proj_deg;
+        P_decoupled = 0.5 * (P_decoupled + P_decoupled.transpose());
+        state_.cov.block<6, 6>(0, 0) =
+            wmode ? (S * P_decoupled * S) : P_decoupled;
       }
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
@@ -866,11 +989,24 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
         for (int k = 0; k < 6; ++k) dd_log_ << dd_last_probe_.m_coefs(k) << " ";
         dd_log_ << dd_last_probe_.deg_rank() << " "
                 << v_deg(3) << " " << v_deg(4) << " " << v_deg(5) << " "
-                << v_obs(3) << " " << v_obs(4) << " " << v_obs(5) << "\n";
+                << v_obs(3) << " " << v_obs(4) << " " << v_obs(5) << " "
+                << dd_last_probe_.tau_eff << "\n";
       }
     }
-    if (EKF_stop_flg) { dd_frame_idx_++; break; }
+    if (EKF_stop_flg)
+    {
+      // Record this sweep's pose correction for the outer sweep convergence
+      // test (prop:comp-iterate block Gauss-Newton termination).
+      prev_pose_corr << rot_add, t_add;
+      break;
+    }
   }
+  }  // ---- end alternating-sweep outer loop (prop:comp-iterate) ----
+
+  // One probe-log line per FRAME (not per sweep) — the sweep loop above may
+  // run the inner ESIKF several times, but the log contract is one line per
+  // converged frame (see initDegeneracy header comment).
+  dd_frame_idx_++;
 
   // double t2 = omp_get_wtime();
   // scan_count++;
@@ -979,6 +1115,49 @@ V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
   return RGB;
 }
 
+void VoxelMapManager::submapMaintenance()
+{
+  // Stage-1 submap maintenance (research task "子图化"): evict voxels that
+  // are BOTH stale (untouched for submap_evict_stale_ frames — typically the
+  // product of a drift episode) AND outside the sliding window (when map
+  // sliding is on; with sliding off the window test degenerates to "far from
+  // the current pose", same expression, position_last_ centered). In-window
+  // stale voxels are KEPT: nearby geometry may still be re-observed by a
+  // loop-back trajectory, and deleting it would remove the only constraint.
+  if (current_frame_id_ % std::max(1, submap_period_) != 0) return;
+  float voxel_size = config_setting_.max_voxel_size_;
+  float loc_xyz[3];
+  for (int j = 0; j < 3; j++)
+  {
+    loc_xyz[j] = position_last_[j] / voxel_size;
+    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+  }
+  const int half = config_setting_.half_map_size;
+  int evicted = 0;
+  for (auto it = voxel_map_.begin(); it != voxel_map_.end(); )
+  {
+    const VOXEL_LOCATION &loc = it->first;
+    auto t = submap_last_touch_.find(loc);
+    const int last_t = (t != submap_last_touch_.end()) ? t->second : -1;
+    const bool stale = (current_frame_id_ - last_t) > submap_evict_stale_;
+    const bool out_of_window =
+        loc.x > (int64_t)loc_xyz[0] + half || loc.x < (int64_t)loc_xyz[0] - half ||
+        loc.y > (int64_t)loc_xyz[1] + half || loc.y < (int64_t)loc_xyz[1] - half ||
+        loc.z > (int64_t)loc_xyz[2] + half || loc.z < (int64_t)loc_xyz[2] - half;
+    if (stale && out_of_window)
+    {
+      delete it->second;
+      it = voxel_map_.erase(it);
+      submap_last_touch_.erase(loc);
+      ++evicted;
+    }
+    else ++it;
+  }
+  if (evicted > 0)
+    std::cout << "[ Submap ] evicted " << evicted << " stale voxels at frame "
+              << current_frame_id_ << std::endl;
+}
+
 void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points)
 {
   float voxel_size = config_setting_.max_voxel_size_;
@@ -997,6 +1176,8 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
       if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    // Submap stage 1: tag this voxel as touched by the current frame.
+    if (submap_enable_) submap_last_touch_[position] = current_frame_id_;
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
     else
@@ -1067,6 +1248,7 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         mylock.lock();
         useful_ptpl[i] = true;
         all_ptpl_list[i] = single_ptpl;
+        all_ptpl_list[i].pv_index_ = i;   // keep the pv_list_ link for write gating
         mylock.unlock();
       }
       else
@@ -1080,6 +1262,64 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   for (size_t i = 0; i < useful_ptpl.size(); i++)
   {
     if (useful_ptpl[i]) { ptpl_list.push_back(all_ptpl_list[i]); }
+  }
+}
+
+// ---- Map-write gating (research task "地图写入门控") ------------------------
+// Called by LIVMapper INSTEAD of UpdateVoxelMap when map_gate_enable_ is on.
+// A point is written only if (a) the final ESIKF iterate produced a valid
+// plane match for it (its pv index appears in ptpl_list_), (b) its converged
+// residual |dis_to_plane_| stays below map_gate_residual_ — a bad pose's
+// points land far from the (healthy) map planes, so this is what actually
+// refuses pollution — and (c) under a degenerate frame the survivors are
+// thinned by stride (1 + deg_rank * map_gate_deg_thin_) so a drifting
+// segment writes fewer points per frame. Points never matched (no plane)
+// are NOT gated (new-area points must still enter the map); they carry no
+// plane evidence either way and starving them would freeze map growth.
+// ------------------------------------------------------------------------
+void VoxelMapManager::UpdateVoxelMapGated(const std::vector<pointWithVar> &input_points)
+{
+  // Rebuild the per-point decision from the final-iterate residual list.
+  dd_write_mask_.assign(input_points.size(), 1);
+  long blocked = 0;
+  // (a)+(b): matched points obey the residual cap.
+  for (const auto &ptpl : ptpl_list_)
+  {
+    if (ptpl.pv_index_ < 0 || ptpl.pv_index_ >= (int)dd_write_mask_.size()) continue;
+    if (std::fabs(ptpl.dis_to_plane_) > map_gate_residual_)
+    {
+      dd_write_mask_[ptpl.pv_index_] = 0;
+      ++blocked;
+    }
+  }
+  // (c): degeneracy-aware thinning (deterministic stride, per frame).
+  const int stride = 1 + std::max(0, dd_last_probe_.deg_rank()) *
+                           std::max(1, map_gate_deg_thin_);
+  if (stride > 1)
+  {
+    int kept = 0;
+    for (size_t i = 0; i < dd_write_mask_.size(); ++i)
+    {
+      if (dd_write_mask_[i])
+      {
+        if (kept % stride != 0) { dd_write_mask_[i] = 0; ++blocked; }
+        ++kept;
+      }
+    }
+  }
+  dd_gate_blocked_ += blocked;
+
+  if (blocked > 0)
+  {
+    std::vector<pointWithVar> gated;
+    gated.reserve(input_points.size() - blocked);
+    for (size_t i = 0; i < input_points.size(); ++i)
+      if (dd_write_mask_[i]) gated.push_back(input_points[i]);
+    UpdateVoxelMap(gated);
+  }
+  else
+  {
+    UpdateVoxelMap(input_points);
   }
 }
 

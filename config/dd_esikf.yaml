@@ -24,23 +24,102 @@ dd_esikf:
 
   # Degeneracy criterion (Definition 1 in theory.tex). A direction v_k is
   # degenerate iff  λ_k < tau_abs  OR  λ_k/λ_1 < tau_rel.
-  # Default 1.0 flags both the strictly-unobservable (λ=0) and the
-  # weakly-observable (λ~0.2) directions in the tilted-corridor simulation.
-  # Tune per scene: a larger value makes the mask more aggressive.
+  #
+  # These are TWO READINGS OF ONE THRESHOLD, not two switches. Both branches
+  # are affine in λ_1, so the rule collapses to
+  #     λ_k < τ_k,   τ_k = max(tau_abs, tau_rel·λ_1).
+  # The SAME τ_k now drives both the degenerate/observable split
+  # (deg_indices, Π_deg) and the mask (m_k = clip(λ_k/τ_k, 0, 1)) — before
+  # 2026-09-24 the split used τ_k while the mask used tau_abs alone, so on real
+  # data tau_abs never fired (λ_L spans 1.2e2…9.2e11, m_k ≡ 1, M = I) while
+  # tau_rel fired on 100% of frames: the mean path was a no-op and the covariance
+  # path was active, i.e. two different D sets in one probe result.
+  # A larger value makes the mask more aggressive.
   tau_abs: 1.0
   tau_rel: 0.001
 
+  # ---------------------------------------------------------------------------
+  # §2.2 Whitened criterion (2026-09-24). When true the degeneracy criterion runs
+  # on the WHITENED information
+  #     W = S Λ_f S,   S = (P^-)^{1/2}   (P^- = the propagated 6×6 pose cov)
+  # so w_k = sensor information / prior information, DIMENSIONLESS. The thresholds
+  # are then tau_w_abs / tau_w_rel above (not tau_abs/tau_rel), and the whole
+  # verdict is invariant under error reparametrization ξ → Tξ:
+  #     W' = (P')^{1/2} Λ' (P')^{1/2}  ~  W   ⇒ spec, flags, rank, mask unchanged.
+  # This removes the defect of the raw criterion, whose reference λ_1 is on real
+  # Outdoor04 data a ROTATIONAL eigenvalue (the top eigenvector's position-block
+  # norm has mean 0.057), so translational degeneracy was being decided by
+  # rotational observability. Reproduced in research/test_whitened.cpp: with
+  # translational λ = 5.0e7 and ONLY the rotational block ×100, the raw criterion's
+  # translational flags flip [000] → [111]; the whitened one does not move.
+  #
+  # READ THIS BEFORE ENABLING. w_k ≪ 1 means "the sensor is SILENT", not "the
+  # sensor is UNRELIABLE". On Outdoor04 (14763 logged frames, block-diagonal
+  # reconstruction of the real spectra) the median is w_pos = 118.7 / w_rot = 267.6
+  # — both far above tau_w_abs — so this switch makes the DD mask a no-op in
+  # effect. The contrast is in the TRIGGER RATE, not the margin:
+  #     whitened fires on   0.72% of frames   (deg_rank mean 0.009)
+  #     raw      fires on 100.00% of frames   (deg_rank mean 1.813, tau_k sits
+  #                                            above the translational median)
+  # A degeneracy flag that is on every frame carries no information; that is the
+  # defect this criterion fixes. It is the right criterion for a scene where the
+  # LiDAR really carries no information (facing a wall, open sky, featureless
+  # tunnel); it is the WRONG instrument for Outdoor04's failure mode, which is
+  # weak-direction residual BIAS. Bias is the residual channel's job
+  # (thm:residual, cor:tilt-resolution). The two channels compose; they are not
+  # substitutes. Default false = raw criterion, i.e. unchanged behaviour.
+  #
+  # >>> tau_w_rel MUST STAY SMALL. With the real P^- (median w_1 = 2.6e19 — the
+  #     top whitened direction is an overwhelmingly well-constrained one), the
+  #     RELATIVE branch of tau_w = max(tau_w_abs, tau_w_rel·w_1) takes over the
+  #     moment tau_w_rel exceeds ~1e-17, and the criterion stops being about
+  #     silence at all:
+  #         tau_w_rel = 0     -> fires on       0.13% of frames (absolute branch)
+  #         tau_w_rel = 1e-9  -> fires on      97.0%
+  #         tau_w_rel = 1e-6  -> fires on      99.3%
+  #         tau_w_rel = 1e-3  -> fires on     100.0%   <-- the raw criterion again
+  #     i.e. the scale-relative branch reintroduces exactly the defect (§2.1:
+  #     a ratio threshold has no dimension) that whitening removed. On this bag
+  #     the absolute branch is the meaningful one; a LIVE run (WHITEN_smoke_r1)
+  #     confirms it: w_min ~ 3.0e5 with tau_w_rel = 1e-3 as shipped below gives a
+  #     degenerate set on 100% of frames and deg_rank ~ 4 in whitened mode.
+  whiten_enable: false
+  # Dimensionless thresholds on w_k (units of prior information). Only used when
+  # whiten_enable is true. tau_w_abs = 0.25 also becomes the prior-information
+  # floor on the covariance path's degenerate block in this mode (it replaces
+  # default_prior_info there), so the mean and covariance paths keep using ONE
+  # quantity — the same discipline the single-threshold fix established.
+  # >>> tau_w_rel SHIPS AT 0.0, and that is the verified setting, not a shrug.
+  #     In whitened coordinates the relative branch reads "degenerate if the
+  #     sensor's information is w_1/tau_w_rel times smaller than the BEST
+  #     direction's" — but w_1 is dimensionless only in the sense that it is a
+  #     ratio, and on real Outdoor04 it is 2.6e19 (median). A ratio to it is the
+  #     same dimensionally-empty rule §2.1 removed from the raw criterion; the
+  #     whitening does not repair it, because whitening fixes the UNITS, not the
+  #     reference. Trigger rate on the live whitened run (WHITEN_smoke_r1):
+  #         tau_w_rel = 0     -> fires on   0.13% of frames (absolute branch only)
+  #         tau_w_rel = 1e-9  -> fires on  97.0%
+  #         tau_w_rel = 1e-6  -> fires on  99.3%
+  #         tau_w_rel = 1e-3  -> fires on 100.0%   (deg_rank ~ 4: the raw criterion
+  #                                                again, in different clothes)
+  #     Set it > 0 only when the relative branch is itself the object of study.
+  tau_w_abs: 0.25
+  tau_w_rel: 0.0
+
   # Mask shape (Proposition 5 / Assumption 1).
-  # false (default) => continuous mask m_k = clip(λ_k/tau_abs, 0, 1).
+  # false (default) => continuous mask m_k = clip(λ_k/τ_k, 0, 1).
   # true             => hard 0/1 mask (stricter consistency guarantee, Corollary).
   hard_mask: false
 
   # Constant prior information floor injected along EVERY degenerate direction
-  # when no PriorSource is wired (i.e. dd_prior_src_ == nullptr in code).
+  # (applied regardless of whether a PriorSource is wired).
   # 0.0  => pure masking (B2). The degenerate dir gets no information and its
   #        variance does not contract (Theorem 4 / Corollary).
-  # >0   => constant-information prior (a simplified B3). The degenerate dir is
-  #        pulled toward zero with information = default_prior_info. Useful for
+  # >0   => const-information floor on degenerate dirs, applied whether or not
+  #        a PriorSource is wired (assemblePrior no longer early-returns on a
+  #        null source, so the mean and covariance paths use the same
+  #        information). This is a ZERO-MEAN virtual observation: b_pr = 0, so
+  #        it floors the covariance without pulling the mean. Useful for
   #        ablation without wiring a real IMU prior.
   # >>> ENABLED (5.0) — gives T1 a working prior floor so the degenerate dir is
   #     not left with zero information when T3 keeps its variance at the prior.
@@ -142,6 +221,51 @@ dd_esikf:
   anchor_enable: false
   anchor_lambda: 0.0
   anchor_obs: 0.0
+
+  # ---------------------------------------------------------------------------
+  # Map-write gating (anti-pollution). Breaks the pollution feedback loop
+  # (bad pose -> bad points written -> bad residual -> worse pose) at the
+  # WRITE step: a point whose converged plane residual exceeds
+  # map_gate_residual (m) is refused from the voxel map — polluted voxels
+  # cannot be repaired by filtering, only starved. When the frame probe
+  # reports degeneracy, surviving writes are additionally thinned by stride
+  # (1 + deg_rank * map_gate_deg_thin) so a drifting segment contaminates the
+  # map at a lower rate. No-op when map_gate_enable: false.
+  map_gate_enable: true
+  map_gate_residual: 0.20
+  map_gate_deg_thin: 1
+
+  # ---------------------------------------------------------------------------
+  # Alternating DD sweeps (theory.tex prop:comp-iterate). One LIO pass per
+  # frame is the k=1 truncation of block Gauss-Newton on the joint MAP cost;
+  # under COUPLED degeneracy (probe degenerate + visual Λ_V present) the
+  # single-sweep DD substitution leaves an O(||e_L||) re-linearization gap on
+  # the frozen directions. When comp_sweep_enable is true and the probe is
+  # degenerate, the inner ESIKF loop re-runs from the just-updated posterior
+  # (fresh probe + fresh DD substitution at the new linearization point), up
+  # to comp_sweep_max passes, stopping early once the pose correction falls
+  # below comp_sweep_tol — recovering the joint fixed point. Sweeps > 1 never
+  # fire on healthy frames, so the common path keeps the k=1 cost.
+  comp_sweep_enable: false
+  comp_sweep_max: 2
+  comp_sweep_tol: 0.001
+
+  # ---------------------------------------------------------------------------
+  # Submap management, stage 1 (anti-pollution). The unbounded global voxel
+  # map is the reservoir of map pollution: nothing ever leaves it, so a drift
+  # episode keeps contaminating matching far into the trajectory. With
+  # submap_enable: true, each root voxel is tagged with the last frame that
+  # touched it, and every submap_period frames the maintenance pass evicts
+  # voxels that are BOTH idle for > submap_evict_stale frames AND outside the
+  # sliding window (half_map_size around the current pose). Stale in-window
+  # voxels are kept — a loop-back trajectory may still need them. This adds
+  # the TIME dimension to map_sliding's geometric window; typical products of
+  # a drift episode (written once, never re-observed) leave the map.
+  # NOTE: stage 2 (periodic re-alignment of submap origins) needs the PGO
+  # backend and is intentionally not implemented here.
+  submap_enable: false
+  submap_period: 50
+  submap_evict_stale: 500
 
   # ---------------------------------------------------------------------------
   # Real IMU preintegration prior (Theorems T2/T3 wiring). When true,

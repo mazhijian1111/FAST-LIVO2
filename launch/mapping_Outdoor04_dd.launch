@@ -35,6 +35,24 @@
 	<arg name="imu_prior_enable" default="" />
 	<arg name="anchor_enable" default="" />
 	<arg name="anchor_lambda" default="" />
+	<!-- Explicit experiment controls.  Empty keeps the YAML value; the
+	     baseline runner sets every one so B0 is genuinely enhancement-free. -->
+	<arg name="adaptive_enable" default="" />
+	<arg name="aniso_enable" default="" />
+	<arg name="map_gate_enable" default="" />
+	<arg name="comp_sweep_enable" default="" />
+	<arg name="submap_enable" default="" />
+	<arg name="robust_vio_enable" default="" />
+	<arg name="cross_modal_select_enable" default="" />
+	<arg name="gate_enable" default="" />
+	<arg name="dist_noise_enable" default="" />
+	<!-- §2.2 whitened degeneracy criterion (W = S Λ_f S, S = (P^-)^{1/2}).
+	     Empty keeps the YAML default (false = raw criterion). Read the
+	     "READ THIS BEFORE ENABLING" note in dd_esikf.yaml first: on this bag the
+	     whitened criterion fires on 0.72% of frames where the raw one fires on
+	     100%, so enabling it makes the DD mask nearly inert — the intended
+	     prediction of such a run is ATE → the non-DD baseline. -->
+	<arg name="whiten_enable" default="" />
 
 	<param name="use_sim_time" value="true" />
 
@@ -74,6 +92,16 @@
 	<param if="$(eval imu_prior_enable != '')" name="dd_esikf/imu_prior_enable" value="$(arg imu_prior_enable)" />
 	<param if="$(eval anchor_enable != '')" name="dd_esikf/anchor_enable"       value="$(arg anchor_enable)" />
 	<param if="$(eval anchor_lambda != '')" name="dd_esikf/anchor_lambda"       value="$(arg anchor_lambda)" />
+	<param if="$(eval adaptive_enable != '')" name="dd_esikf/adaptive_enable" value="$(arg adaptive_enable)" />
+	<param if="$(eval aniso_enable != '')" name="dd_esikf/aniso_enable" value="$(arg aniso_enable)" />
+	<param if="$(eval map_gate_enable != '')" name="dd_esikf/map_gate_enable" value="$(arg map_gate_enable)" />
+	<param if="$(eval comp_sweep_enable != '')" name="dd_esikf/comp_sweep_enable" value="$(arg comp_sweep_enable)" />
+	<param if="$(eval submap_enable != '')" name="dd_esikf/submap_enable" value="$(arg submap_enable)" />
+	<param if="$(eval robust_vio_enable != '')" name="vio/robust_vio_enable" value="$(arg robust_vio_enable)" />
+	<param if="$(eval cross_modal_select_enable != '')" name="vio/cross_modal_select_enable" value="$(arg cross_modal_select_enable)" />
+	<param if="$(eval gate_enable != '')" name="vio/gate_enable" value="$(arg gate_enable)" />
+	<param if="$(eval dist_noise_enable != '')" name="imu/dist_noise_enable" value="$(arg dist_noise_enable)" />
+	<param if="$(eval whiten_enable != '')" name="dd_esikf/whiten_enable" value="$(arg whiten_enable)" />
 
 	<!-- The bag stores the RGB stream as sensor_msgs/CompressedImage. -->
 	<node pkg="image_transport" type="republish" name="outdoor04_image_decompress"

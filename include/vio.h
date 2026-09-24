@@ -184,6 +184,15 @@ public:
   Eigen::Matrix<double, 6, 1> gate_diff_read_ =
       Eigen::Matrix<double, 6, 1>::Zero();
   bool   gate_diff_valid = false;
+  // Consistent gate state: when the per-direction gate modified Λ_V's pose
+  // block (above), the SAME u_k weights must be applied to the residual
+  // information vector b_V in Λ_V's eigenbasis (mean/covariance-consistent
+  // weighted observation). Cached basis/u from the last gate application.
+  bool   gate_b_V_scale_valid = false;
+  Eigen::Matrix<double, 6, 6> gate_b_V_basis =
+      Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> gate_b_V_u =
+      Eigen::Matrix<double, 6, 1>::Ones();
 
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;

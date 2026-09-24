@@ -62,6 +62,7 @@ typedef struct PointToPlane
   Eigen::Matrix<double, 6, 6> plane_var_;
   M3D body_cov_;
   int layer_;
+  int pv_index_ = -1;   // index into pv_list_ this residual came from (map-write gating)
   double d_;
   double eigen_value_;
   bool is_valid_;
@@ -237,6 +238,12 @@ public:
 
   void UpdateVoxelMap(const std::vector<pointWithVar> &input_points);
 
+  // Map-write gating wrapper (research task "地图写入门控"): filters
+  // input_points by the converged residual + degeneracy thinning, then
+  // delegates to UpdateVoxelMap. Call this from LIVMapper when
+  // map_gate_enable_ is true.
+  void UpdateVoxelMapGated(const std::vector<pointWithVar> &input_points);
+
   void BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list);
 
   void build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &prob,
@@ -257,6 +264,13 @@ public:
   bool dd_fused_mask_ = true;  // T1: probe on Λ_f = Λ_L + Λ_V (gates Λ_V use)
   // Latest probe result, exposed for diagnostics / plotting.
   dd_esikf::DegeneracyResult dd_last_probe_;
+  // §2.2 whitened mode: the whitened-coordinate (ξ̃) projectors from the last
+  // probe, cached because the covariance path needs them (the ξ-space
+  // projectors in dd_last_probe_ are the raw/ill-scaled ones and are NOT what
+  // the projection should consume in whitened mode — see the note at the
+  // covariance update). Identity/zero when the probe ran on the raw criterion.
+  Eigen::Matrix<double, 6, 6> dd_Pi_obs_tilde_cached_ = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 6> dd_Pi_deg_tilde_cached_ = Eigen::Matrix<double, 6, 6>::Zero();
   // Per-frame cache of effective Λ and H^T R^-1 z so inner ESIKF iterations
   // reuse the same masked quantities (Assumption 1 / Proposition 5).
   Eigen::Matrix<double, 6, 6> dd_Lambda_eff_cached_ = Eigen::Matrix<double, 6, 6>::Zero();
@@ -324,6 +338,53 @@ public:
   // LIVMapper each LIO frame. When false, the B3 constant floor
   // (default_prior_info) is the only degenerate-subspace prior.
   bool imu_prior_enable_ = false;
+  // ---- Map-write gating (anti-pollution, research task "地图写入门控") ----
+  // The pollution feedback loop (bad pose -> bad points written -> bad
+  // residual -> worse pose) is broken at the WRITE step: after the ESIKF
+  // converges, a point whose final plane residual exceeds
+  // map_gate_residual_ (absolute, meters) is NOT written into the voxel map
+  // — a polluted voxel can never be repaired by filtering, only starved.
+  // When the frame probe reports degeneracy (dd_last_probe_), writes are
+  // additionally THINNED: only every (1+deg_rank)-th surviving point is
+  // written (map_gate_deg_thin_), so a drifting segment contaminates the
+  // map at a lower rate. No-op when map_gate_enable_ is false (default).
+  bool   map_gate_enable_   = false;
+  double map_gate_residual_ = 0.20;   // absolute residual cap for writes (m)
+  int    map_gate_deg_thin_ = 1;      // extra stride per degenerate direction
+  std::vector<char> dd_write_mask_;   // 1 = write pv_list_[i], sized per frame
+  long   dd_gate_blocked_ = 0;        // diagnostics: points refused so far
+  // ---- Alternating DD sweeps (theory.tex prop:comp-iterate) ----------------
+  // One LIO pass per frame is the k=1 truncation of block Gauss-Newton on the
+  // joint MAP cost: the LiDAR block re-linearizes the ESIKF fixed point, but
+  // under COUPLED degeneracy (probe degenerate while a valid Λ_V exists) the
+  // single-sweep DD substitution leaves an O(||e_L||) re-linearization gap
+  // (thm:comp-gap) on exactly the directions the mask froze. comp_sweep_max_
+  // > 1 re-runs the whole inner ESIKF loop from the just-updated posterior
+  // (fresh probe, fresh DD substitution at the new linearization point) and
+  // stops early when the pose correction falls below comp_sweep_tol_ —
+  // block Gauss-Newton recovering the joint fixed point. Sweeps > 1 only
+  // fire when the probe is degenerate, so healthy frames keep the k=1 cost.
+  bool   comp_sweep_enable_ = false;
+  int    comp_sweep_max_    = 2;       // total LIO sweeps per frame (incl. first)
+  double comp_sweep_tol_    = 1e-3;     // pose-correction tol (rad mix m, weighted)
+  // ---- Submap bookkeeping (research task "子图化", stage 1) -----------------
+  // The global voxel map's unbounded accumulation is the reservoir of map
+  // pollution: nothing ever leaves it, so a drift episode keeps contaminating
+  // matching far into the trajectory. Stage 1 bounds the damage by managing
+  // the map as an index of submaps: each root voxel is tagged with the frame
+  // that last TOUCHED it, and periodic maintenance (every submap_period_
+  // frames) evicts submaps that have been idle for submap_evict_stale_ frames
+  // and lie outside the sliding window (config_setting_.half_map_size).
+  // This is orthogonal to map_sliding (which handles the geometric window);
+  // it adds the TIME dimension: stale submaps — typically the products of a
+  // drift episode — leave the map even if geometry alone would keep them.
+  // Stage 2 (periodic pose-graph re-alignment of submap origins) requires the
+  // PGO backend and is intentionally NOT faked here.
+  bool submap_enable_       = false;
+  int  submap_period_       = 50;       // maintenance cadence (frames)
+  int  submap_evict_stale_  = 500;      // idle frames before an out-of-window submap is evicted
+  std::unordered_map<VOXEL_LOCATION, int> submap_last_touch_;  // voxel -> frame
+  void submapMaintenance();
   // Optional file logger for per-frame degeneracy probe (Project A eval).
   std::string dd_log_file_;                          // empty => disabled
   std::ofstream dd_log_;                             // opened in initDegeneracy

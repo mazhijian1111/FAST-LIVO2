@@ -1398,6 +1398,9 @@ void VIOManager::precomputeReferencePatches(int level)
 void VIOManager::updateStateInverse(cv::Mat img, int level)
 {
   if (total_points == 0) return;
+  // This path never applies the per-direction gate, so make sure no stale
+  // basis/weights from a previous updateState() call leak into it.
+  gate_b_V_scale_valid = false;
   StatesGroup old_state = (*state);
   V2D pc;
   MD(1, 2) Jimg;
@@ -1527,15 +1530,25 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       G.setZero();
       H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
-      auto &&HTz = H_sub_T * z;
+      // H_sub_T is 6×H_DIM here, so HTz is 6×1 (pose block only).
+      Eigen::Matrix<double, 6, 1> HTz_vec = H_sub_T * z;
+      // Consistent gate (Codex issue #3): when the per-direction gate reshaped
+      // Λ_V, the SAME u_k must weight the residual information vector in Λ_V's
+      // eigenbasis. No-op when the gate is disabled.
+      if (gate_b_V_scale_valid)
+      {
+        Eigen::Matrix<double, 6, 1> b_proj =
+            gate_b_V_basis.transpose() * HTz_vec.head<6>();
+        HTz_vec = gate_b_V_basis * (gate_b_V_u.cwiseProduct(b_proj));
+      }
       // ---- P2 fused-mask: cache the VIO pose information block (6×6 + 6×1)
       // for the LIO degeneracy probe on Λ_f = Λ_L + Λ_V (Theorem T1). ----
       last_Lambda_V = H_T_H.block<6, 6>(0, 0);
-      last_b_V      = HTz.head<6>();
+      last_b_V      = HTz_vec.head<6>();
       last_V_valid  = true;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
-      auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+      auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz_vec + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);
       auto &&t_add = solution.block<3, 1>(3, 0);
@@ -1558,6 +1571,9 @@ void VIOManager::updateState(cv::Mat img, int level)
 {
   if (total_points == 0) return;
   StatesGroup old_state = (*state);
+  // Clear any gate state left over from the previous call/level; it is only
+  // re-armed below when the per-direction gate actually fires this iteration.
+  gate_b_V_scale_valid = false;
 
   VectorXd z;
   MatrixXd H_sub;
@@ -1789,7 +1805,10 @@ void VIOManager::updateState(cv::Mat img, int level)
       {
         // Plug-in read (B1): mean residual energy in noise-units, clamped at
         // the consistent value (the read is frequently negative frame-wise).
-        const double nu_inst = error / std::max(1e-9, (double)n_meas) / img_point_cov;
+        // NOTE: `error` was already normalized by n_meas at the loop bottom
+        // (error = error / n_meas) — do NOT divide by n_meas again here, or
+        // nu_inst is understated by ~n_meas× and b2_plug never activates.
+        const double nu_inst = error / std::max(1e-9, img_point_cov);
         gate_nu_V = (1.0 - gate_nu_alpha) * gate_nu_V + gate_nu_alpha * nu_inst;
         const double b2_plug = std::max(gate_nu_V - 1.0, 0.0);
         // Per-direction infos in Λ_V's eigenbasis.
@@ -1823,24 +1842,50 @@ void VIOManager::updateState(cv::Mat img, int level)
         }
         gate_u_V = u_k.mean();  // diagnostics: the average gate factor
         // Assemble the per-direction gate matrix in Λ_V's eigenbasis.
+        // Consistent weighted-observation update (Codex issue #3 fix): the
+        // gate is interpreted as per-direction noise inflation σ_k → σ_k/u_k,
+        // which scales the information contribution by u_k² AND the residual
+        // information vector by u_k. Gating Λ alone while keeping b unchanged
+        // is inconsistent (δx = b/(π + u²λ) can INCREASE as λ shrinks at
+        // fixed b). Both are transformed in Λ_V's eigenbasis:
+        //   Λ_V,gated = Σ u_k² λ_k v_k v_k^T,  b_V,gated = Σ u_k (v_k^T b) v_k.
+        // At u ≡ 1 both reduce exactly to the ungated quantities.
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(LamV);
         Eigen::Matrix<double, 6, 1> lam_g =
             es.eigenvalues().cwiseMax(0.0).cwiseProduct(u_k.cwiseProduct(u_k));
         H_T_H.block<6, 6>(0, 0) =
             es.eigenvectors() * lam_g.asDiagonal() * es.eigenvectors().transpose();
+        // b-side: scale AFTER the K_1 assembly below uses H_T_H; HTz is
+        // rebuilt each iteration from H_sub_T * z, so gate the same block of
+        // H_sub_T rows is not straightforward — instead gate HTz head(6) when
+        // it is consumed (see the HTz gating right after K_1 assembly).
+        gate_b_V_scale_valid = true;
+        gate_b_V_basis = es.eigenvectors();
+        gate_b_V_u = u_k;
       }
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
-      auto &&HTz = H_sub_T * z;
+      // H_sub_T is 7×H_DIM here (pose block + exposure column), so HTz is 7×1.
+      Eigen::Matrix<double, 7, 1> HTz_vec = H_sub_T * z;
+      // Consistent gate (Codex issue #3): weight the residual information vector
+      // with the SAME u_k that reshaped Λ_V, in Λ_V's eigenbasis. Only the pose
+      // block (head<6>) is gated; the exposure entry is left untouched because
+      // the gate was derived on the 6×6 pose information. No-op when disabled.
+      if (gate_b_V_scale_valid)
+      {
+        Eigen::Matrix<double, 6, 1> b_proj =
+            gate_b_V_basis.transpose() * HTz_vec.head<6>();
+        HTz_vec.head<6>() = gate_b_V_basis * (gate_b_V_u.cwiseProduct(b_proj));
+      }
       // ---- P2 fused-mask: cache the VIO pose information block (6×6 + 6×1)
       // for the LIO degeneracy probe on Λ_f = Λ_L + Λ_V (Theorem T1). ----
       last_Lambda_V = H_T_H.block<6, 6>(0, 0);
-      last_b_V      = HTz.head<6>();
+      last_b_V      = HTz_vec.head<6>();
       last_V_valid  = true;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 7>(0, 0) = K_1.block<DIM_STATE, 7>(0, 0) * H_T_H.block<7, 7>(0, 0);
       MD(DIM_STATE, 1)
-      solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec - G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
+      solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz_vec + vec - G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
 
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);

@@ -479,6 +479,13 @@ void LIVMapper::handleLIO()
   }
 
   voxelmap_manager->StateEstimation(state_propagat);
+  // Submap stage 1 (research task "子图化"): advance the frame counter and
+  // run periodic stale-submap eviction after each LIO frame.
+  if (voxelmap_manager->submap_enable_)
+  {
+    voxelmap_manager->current_frame_id_++;
+    voxelmap_manager->submapMaintenance();
+  }
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
 
@@ -532,7 +539,14 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+  // Map-write gating (research task "地图写入门控"): when enabled, points
+  // with a bad converged residual (and, under degeneracy, a thinned subset)
+  // are refused from the voxel map — breaks the pollution feedback loop at
+  // the write step. Falls back to the unconditional write when disabled.
+  if (voxelmap_manager->map_gate_enable_)
+    voxelmap_manager->UpdateVoxelMapGated(voxelmap_manager->pv_list_);
+  else
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   

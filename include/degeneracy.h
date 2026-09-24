@@ -40,21 +40,80 @@ static constexpr int kPoseDim = 6;
 namespace dd_esikf {
 
 // ============================================================================
+// 0. Whitened-criterion configuration (section 2b below)
+// ============================================================================
+// Declared before DegeneracyConfig because the latter embeds it (whiten).
+struct WhitenedConfig {
+  // Dimensionless thresholds on w_k (units of prior information).
+  // tau_w_abs = 0.25 is the pivot used for the covariance path: below it the
+  // sensor adds less than a quarter of the information the prior already
+  // carries. (1.0 is the "sensor adds nothing over the prior" reading — a
+  // defensible alternative; 0.25 is chosen so the criterion has a usable
+  // dynamic range on real data, where the ratio spans several decades.)
+  double tau_w_abs = 0.25;
+  // Relative reading, vs. w_1. DEFAULT 0.0 = the branch is OFF, and that is the
+  // verified setting rather than a placeholder: w_1 is still a RATIO's reference,
+  // and on real Outdoor04 it is 2.6e19 (median, live whitened run), so any
+  // tau_w_rel > ~1e-17 hands the threshold to the relative branch and
+  // "degenerate" fires on essentially every frame — 97.0% at 1e-9, 99.3% at
+  // 1e-6, 100.0% (deg_rank ~4) at 1e-3. That is the §2.1 defect in different
+  // clothes: whitening fixes the UNITS of the comparison, not the choice of
+  // reference. The absolute branch is the one that means "the sensor is silent".
+  // Set this > 0 only when the relative branch is itself the object of study.
+  double tau_w_rel = 0.0;
+  // Hard 0/1 mask instead of the continuous clip. Same semantics as
+  // DegeneracyConfig::hard_mask.
+  bool hard_mask = false;
+  // Eigenvalue floor applied to P^- before the square root, so a
+  // rank-deficient / numerically singular prior block cannot produce inf.
+  double prior_ev_floor = 1e-12;
+};
+
+// Symmetric square root of an SPD matrix and of its inverse, with an eigenvalue
+// floor so a singular prior block degrades gracefully instead of blowing up.
+inline void symSqrtAndInverse(const Eigen::Matrix<double, kPoseDim, kPoseDim>& P,
+                              double ev_floor,
+                              Eigen::Matrix<double, kPoseDim, kPoseDim>& S,
+                              Eigen::Matrix<double, kPoseDim, kPoseDim>& S_inv) {
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, kPoseDim, kPoseDim>> es(P);
+  // cwiseMax guards a negative eigenvalue from round-off in a PSD input.
+  const Eigen::Matrix<double, kPoseDim, 1> d =
+      es.eigenvalues().cwiseMax(ev_floor);
+  const Eigen::Matrix<double, kPoseDim, kPoseDim>& V = es.eigenvectors();
+  S     = V * d.cwiseSqrt().asDiagonal() * V.transpose();
+  S_inv = V * d.cwiseInverse().cwiseSqrt().asDiagonal() * V.transpose();
+}
+
+// ============================================================================
 // 1. Configuration
 // ============================================================================
 struct DegeneracyConfig {
   // Dual degeneracy criterion (Definition 1 in theory.tex).
   // A direction v_k is degenerate iff  λ_k < tau_abs  OR  λ_k/λ_1 < tau_rel.
-  double tau_abs = 1.0;   // absolute threshold on λ_k (scene/sensor tuned)
-  double tau_rel = 1e-3;  // relative threshold vs. the largest eigenvalue
-
-  // Mask shape: m_k = clip(λ_k / tau_abs, 0, 1). A direction with λ_k = 0
-  // gets m_k = 0 (fully masked); a direction with λ_k = tau_abs gets m_k = 1
-  // (unmasked); in between the mask is continuous, avoiding hard-threshold
-  // chatter (Proposition 5 / Assumption 1 require iterate-independence, and a
-  // continuous mask also keeps Lambda_eff PSD).
   //
-  // Optional: hard-mask the weakly-degenerate directions for a stricter
+  // IMPORTANT (fixed 2026-09-24): these are TWO READINGS OF ONE QUANTITY, not
+  // two independent switches. The RHS of both branches is affine in λ_1, so
+  //
+  //     (λ_k < tau_abs) ∨ (λ_k/λ_1 < tau_rel)
+  //       ⇔  λ_k < max(tau_abs, tau_rel·λ_1)  =:  τ_k .
+  //
+  // Previously τ_k was used for the degenerate/observable SPLIT (→ deg_indices,
+  // Π_deg, and the covariance projection) while the MASK used tau_abs alone
+  // (m_k = clip(λ_k/tau_abs, 0, 1)). On real data tau_abs never fires
+  // (λ_L spans 1.2e2…9.2e11, so m_k ≡ 1 and M = I), while tau_rel fires on
+  // 100% of frames — leaving the mean path a no-op and the covariance path
+  // active, i.e. two inconsistent definitions of D inside a single probe
+  // result. Both now use τ_k, so D = {k : m_k < 1} is a single set.
+  double tau_abs = 1.0;   // absolute reading of τ_k (scene/sensor tuned)
+  double tau_rel = 1e-3;  // relative reading of τ_k, vs. the largest eigenvalue
+
+  // Mask shape: m_k = clip(λ_k / τ_k, 0, 1) with τ_k = max(tau_abs,
+  // tau_rel·λ_1). A direction at the threshold gets m_k = 1 (unmasked); one at
+  // λ_k = 0 gets m_k = 0. Continuous avoids hard-threshold chatter
+  // (Proposition 5 / Assumption 1 need iterate-independence, and a continuous
+  // mask also keeps Λ_eff PSD).
+  //
+  // Optional: hard-mask the weakly-observable directions for a stricter
   // consistency guarantee (Corollary), at the cost of rejecting some genuine
   // weak information. Default false (continuous).
   bool hard_mask = false;
@@ -69,6 +128,24 @@ struct DegeneracyConfig {
   // Required by Assumption 1 (iterate-independence) for Proposition 5
   // (convergence). KEEP THIS TRUE unless you have a reason to re-linearize.
   bool per_frame_mask = true;
+
+  // ---- Whitened criterion (probeWhitened, section 2b below) ----------------
+  // When true, `probe()` runs the criterion on the WHITENED information
+  //   W = S Λ_f S,   S = (P^-)^{1/2}
+  // and reports the WHITENED eigenvectors and projectors. The degenerate set D
+  // is then {k : w_k < tau_w} instead of {k : λ_k < τ_k}, i.e. dimensionless
+  // and invariant under error reparametrization (see the invariance note in
+  // section 2b). Requires `prior_cov` to be filled by the caller (set it via
+  // `setPriorCov`); if prior_cov_present is false (the default) the probe falls
+  // back to the raw criterion, so nothing silently changes for callers that do
+  // not supply a prior.
+  bool whiten_enable = false;
+  WhitenedConfig whiten;   // tau_w_abs / tau_w_rel / hard_mask / prior_ev_floor
+  // Prior pose covariance P^- and its validity flag. `prior_cov_present` is the
+  // gate: whiten_enable is a no-op without it.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> prior_cov =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Zero();
+  bool prior_cov_present = false;
 };
 
 // ============================================================================
@@ -79,6 +156,9 @@ struct DegeneracyResult {
   Eigen::Matrix<double, kPoseDim, 1> eigvals;   // λ_1 ≥ ... ≥ λ_6 ≥ 0
   Eigen::Matrix<double, kPoseDim, kPoseDim> eigvecs;  // columns = v_k
   Eigen::Array<bool, kPoseDim, 1> deg_mask;     // true => degenerate direction
+  // The single effective threshold τ_k = max(tau_abs, tau_rel·λ_1) this probe
+  // used. D = {k : λ_k < τ_k} = {k : m_k < 1}; logged for diagnosis.
+  double tau_eff = 0.0;
 
   // Continuous mask M = Σ m_k v_k v_k^T  (Theorem 3).
   Eigen::Matrix<double, kPoseDim, kPoseDim> M;
@@ -109,18 +189,75 @@ struct DegeneracyResult {
       Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
   Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_deg =
       Eigen::Matrix<double, kPoseDim, kPoseDim>::Zero();
+
+  // ---- Whitened criterion (section 2b): set only when the probe was run in
+  // whitened mode. `eigvals`/`eigvecs`/`M`/`Pi_obs`/`Pi_deg` above then refer to
+  // the WHITENED quantities W = S Λ_f S and its eigenbasis — the eigenvectors
+  // are ũ_k, and every direction is S^{-1}-related to the ξ-space direction
+  // u_k = S ũ_k, which is the one the mask/prior should be assembled on.
+  // `tau_whitened` records which criterion produced this result (logged).
+  bool tau_whitened = false;
+  Eigen::Matrix<double, kPoseDim, kPoseDim> whiten_S =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  Eigen::Matrix<double, kPoseDim, kPoseDim> whiten_S_inv =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  // ξ-space direction u_k = S ũ_k (unit PRIOR information: u_jᵀ(P^-)^{-1}u_k =
+  // δ_jk). This is the basis the mask and the prior must be assembled in.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> xi_dirs =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  // ξ-space projectors Π_ξ = S Π̃ S^{-1}. Idempotent, but NOT symmetric — they
+  // are self-adjoint w.r.t. the prior metric (P^-)^{-1}. The covariance path in
+  // voxel_map.cpp needs exactly these, plus the similarity
+  //   P_ξ,pr = S P̃_ξ,pr S
+  // that maps a whitened-coordinate covariance back to ξ. Both formulas are
+  // derived in the wiring note next to the covariance projection.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_obs_xi =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_deg_xi =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Zero();
 };
 
 // Compute the eigendecomposition of Λ_L and assemble the mask. Λ_L must be
 // symmetric PSD (it is H^T R^-1 H, so this holds). Cost: one 6×6 SelfAdjoint
 // eigen-decomposition per frame — microseconds.
+//
+// Two criteria are available, selected by `cfg.whiten_enable`:
+//   false (default, raw):    λ_k of Λ_f,      threshold τ_k = max(tau_abs, tau_rel·λ_1)
+//   true  (whitened, §2.2):  w_k of S Λ_f S,  threshold τ_w = max(tau_w_abs, tau_w_rel·w_1)
+// Both produce the same fields. In the whitened case `eigvecs` holds the
+// WHITENED eigenvectors ũ_k and the projectors are the whitened ones, so the
+// SAME single D set still drives both the mean path (M) and the covariance path
+// (Π_deg) — no second criterion anywhere. See section 2b for what each quantity
+// means in the whitened case, and note that a consumer needing ξ-space
+// projectors or a covariance-basis update must use `whiten_S`/`whiten_S_inv`
+// (reported below and consumed by voxel_map.cpp).
 inline DegeneracyResult probe(const Eigen::Matrix<double, kPoseDim, kPoseDim>& Lambda_L,
                               const DegeneracyConfig& cfg) {
   DegeneracyResult r;
+  // Whiten once, up front: W = S Λ_f S. Everything below is the same code path
+  // with W in place of Λ_f, because a symmetric congruence preserves every
+  // structural property the raw probe relies on (symmetry, PSD-ness, and the
+  // Rayleigh-quotient reading of the eigenvalues).
+  const bool whiten = cfg.whiten_enable && cfg.prior_cov_present;
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Lambda_probe = Lambda_L;
+  if (whiten) {
+    symSqrtAndInverse(cfg.prior_cov, cfg.whiten.prior_ev_floor, r.whiten_S,
+                      r.whiten_S_inv);
+    Lambda_probe = r.whiten_S * Lambda_L * r.whiten_S;
+    Lambda_probe = 0.5 * (Lambda_probe + Lambda_probe.transpose());
+  }
+
+  // Thresholds. Both branches collapse to a single max() for the same reason:
+  // they are two readings of one quantity. In the whitened case both readings
+  // are dimensionless (units of prior information), which is the whole point.
+  const double t_abs = whiten ? cfg.whiten.tau_w_abs : cfg.tau_abs;
+  const double t_rel = whiten ? cfg.whiten.tau_w_rel : cfg.tau_rel;
+  const bool   hard  = whiten ? cfg.whiten.hard_mask : cfg.hard_mask;
+
   // SelfAdjointEigenSolver returns ASCENDING eigenvalues; we want DESCENDING
   // to match the theory's convention λ_1 ≥ ... ≥ λ_6.
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, kPoseDim, kPoseDim>> es(
-      Lambda_L);
+      Lambda_probe);
   Eigen::Matrix<double, kPoseDim, 1> evals = es.eigenvalues();        // ascending
   Eigen::Matrix<double, kPoseDim, kPoseDim> evecs = es.eigenvectors();  // cols
 
@@ -131,18 +268,21 @@ inline DegeneracyResult probe(const Eigen::Matrix<double, kPoseDim, kPoseDim>& L
   }
 
   const double lam1 = r.eigvals(0);
+  const double tau_k = std::max(t_abs, t_rel * std::max(lam1, 1e-12));
+  r.tau_eff = tau_k;
+  r.tau_whitened = whiten;
   r.deg_mask.resize(kPoseDim);
   r.m_coefs.setZero();
   r.M.setZero();
   for (int k = 0; k < kPoseDim; ++k) {
     const double lk = r.eigvals(k);
-    const bool deg = (lk < cfg.tau_abs) || (lk / std::max(lam1, 1e-12) < cfg.tau_rel);
+    // Continuous mask: m_k = clip(λ_k / τ_k, 0, 1). Reference-scaled:
+    // λ_k = τ_k ⇒ m_k = 1 (barely observable, kept), λ_k = 0 ⇒ m_k = 0.
+    const double mk_raw = std::min(1.0, std::max(0.0, lk / std::max(tau_k, 1e-12)));
+    const bool deg = hard ? (mk_raw < 1.0) : (lk < tau_k);
     r.deg_mask(k) = deg;
-    // Continuous mask: m_k = clip(λ_k / tau_abs, 0, 1).
-    double mk = cfg.hard_mask ? (deg ? 0.0 : 1.0)
-                              : std::max(0.0, std::min(1.0, lk / cfg.tau_abs));
-    r.m_coefs(k) = mk;
-    r.M += mk * (r.eigvecs.col(k) * r.eigvecs.col(k).transpose());
+    r.m_coefs(k) = hard ? (deg ? 0.0 : 1.0) : mk_raw;
+    r.M += r.m_coefs(k) * (r.eigvecs.col(k) * r.eigvecs.col(k).transpose());
     if (deg) r.deg_indices.push_back(k);
     else     r.obs_indices.push_back(k);
   }
@@ -150,15 +290,174 @@ inline DegeneracyResult probe(const Eigen::Matrix<double, kPoseDim, kPoseDim>& L
     r.idx_weak   = r.deg_indices.front();   // largest λ_k among degenerate
     r.idx_strict = r.deg_indices.back();    // smallest λ_k
   }
-  // Layer 3 projectors: Π_obs over observable, Π_deg = I − Π_obs.
-  // With a continuous mask the boundary between obs/deg is soft, but the
-  // covariance projection uses the HARD degenerate set (the corollary
-  // regime) so that strictly/weakly-unobservable variance is never
-  // contracted by the LiDAR residual.
+  // Layer 3 projectors: Π_obs over observable, Π_deg = I − Π_obs. With the
+  // single-threshold fix, Π_deg's support is exactly {k : m_k < 1}, so the
+  // mean path (M) and the covariance path (Π_deg) act on the SAME subspace D.
   r.Pi_obs.setZero();
   for (int k : r.obs_indices)
     r.Pi_obs += r.eigvecs.col(k) * r.eigvecs.col(k).transpose();
   r.Pi_deg = Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity() - r.Pi_obs;
+
+  // ---- Whitened mode: everything above is in ξ̃ = S^{-1}ξ coordinates. Map the
+  // directions and the projectors back to ξ once, here, so no consumer has to
+  // know which criterion ran. ----
+  if (whiten) {
+    for (int k = 0; k < kPoseDim; ++k)
+      r.xi_dirs.col(k) = r.whiten_S * r.eigvecs.col(k);
+    r.Pi_obs_xi = r.whiten_S * r.Pi_obs * r.whiten_S_inv;
+    r.Pi_deg_xi = r.whiten_S * r.Pi_deg * r.whiten_S_inv;
+  }
+  return r;
+}
+
+// ============================================================================
+// 2b. Whitened (prior-normalized) degeneracy criterion
+// (WhitenedConfig and symSqrtAndInverse are declared in section 0, above, so
+//  that DegeneracyConfig can embed the former and probe() can call the latter.)
+// ============================================================================
+// WHY. The raw criterion λ_k < τ_k compares a LiDAR information eigenvalue
+// against a threshold built from λ_1. Both carry MIXED PHYSICAL UNITS: the
+// rotational block of Λ_L is in rad^-2, the translational block in m^-2, and
+// λ_1 — the reference of the relative branch — is on real data a ROTATIONAL
+// eigenvalue (its eigenvector's position block has norm ≈ 0.056, see the
+// Outdoor04 probe log). So the translational degeneracy decision currently
+// depends on rotational observability, which is dimensionally meaningless: a
+// scene that merely rotates better re-classifies translation directions.
+//
+// WHAT. Whiten by the prior pose covariance. Let S = (P^-)^{1/2} be the
+// symmetric square root of the 6×6 prior pose covariance. In the error
+// coordinates ξ̃ := S^{-1} ξ the prior covariance is the IDENTITY, since
+//     cov(S^{-1}ξ) = S^{-1} P^- S^{-1} = I   (as (P^-)^{-1} = S^{-1}S^{-1}),
+// and the information matrix transforms as Λ̃_L = S Λ_L S. So
+//     W := S Λ_L S ,
+//     w_k := eig_k(W) = sensor information along direction k, in units of the
+//                       prior information along that same direction,
+// a dimensionless number. w_k = 1 means the sensor contributes exactly as much
+// information as the prior already carries (a factor-2 variance reduction);
+// w_k ≪ 1 means the direction is truly unobservable — the sensor cannot improve
+// on the prior — which is the estimation-theoretic meaning of degeneracy. This
+// is sensor-, scene- and unit-independent: only the RATIO of sensor information
+// to prior information matters.
+//
+// INVARIANCE (the property the raw criterion lacks, and the one worth proving).
+// Under any invertible error reparametrization ξ → ξ' = T ξ, with
+//     Λ' = T^{-T} Λ T^{-1},   P' = T P T^T,
+// we have W' = (P')^{1/2} Λ' (P')^{1/2} orthogonally similar to W, i.e.
+//     spec(W') = spec(W)   exactly,
+// because W ~ ΛP (similarity) and Λ'P' ~ ΛP. Consequently the ORDERED
+// spectrum, the flag pattern {k : w_k < τ_w}, the degenerate rank and the
+// whitened projectors (up to the same orthogonal congruence) are all invariant.
+// The raw criterion has no such property: it is tied to the eigenbasis of Λ_L,
+// whose eigenvalues are not invariant under ξ → Tξ at all.
+//
+// LIMITATION (honest). With a block-diagonal Λ_L and a block-diagonal prior,
+// W is block-diagonal, so rotational and translational decisions decouple
+// EXACTLY — which is what fixes the defect above. In general Λ_L has a non-zero
+// θ–p cross block and the decoupling is only approximate. The invariance above
+// holds regardless.
+//
+// SECOND LIMITATION, worth stating loudly because it changes what the mask
+// means. w_k ≪ 1 is "the sensor is silent". It is NOT the same as "the sensor
+// is unreliable". On a median Outdoor04 frame the translational information is
+// ~10^9 × the prior information, so NO direction is prior-degenerate: whitening
+// says the LiDAR is never silent there. The failure mode in a corridor is that
+// the weak direction's residual is BIASED (the plane fits the wrong surface),
+// not that its information is small. A criterion built on w_k alone therefore
+// cannot fire on Outdoor04's median — by construction, and correctly. Firing on
+// bias is the job of the residual/bias channel (b-side gate, thm:residual,
+// cor:tilt-resolution), and the two channels are complementary: w_k decides
+// "is there information", the bias read decides "is the information credible".
+
+struct WhitenedResult {
+  // W = S Λ_L S, and its descending spectrum/eigenbasis (ũ_k live in the
+  // whitened error coordinates ξ̃).
+  Eigen::Matrix<double, kPoseDim, kPoseDim> W;
+  Eigen::Matrix<double, kPoseDim, 1> w_vals;   // w_1 ≥ … ≥ w_6 ≥ 0
+  Eigen::Matrix<double, kPoseDim, kPoseDim> w_vecs;  // columns = ũ_k
+
+  // The same directions mapped back to ξ-space: u_k = S ũ_k. These are the
+  // ξ-perturbations the whitened problem is about, and they carry UNIT PRIOR
+  // INFORMATION by construction: u_j^T (P^-)^{-1} u_k = δ_jk, so w_k =
+  // u_k^T Λ_L u_k is read as "sensor information per unit prior information".
+  // Under ξ → Tξ they transport geometrically as u'_k = T u_k. Not orthonormal
+  // in the Euclidean metric of ξ (orthonormal in the prior metric) — use them
+  // for reporting/tests; the update should consume the projectors below.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> u_dirs;
+
+  // S = (P^-)^{1/2} and S^{-1}, cached for the caller.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> S, S_inv;
+
+  // Effective dimensionless threshold tau_w = max(tau_w_abs, tau_w_rel·w_1).
+  double tau_eff = 0.0;
+
+  Eigen::Array<bool, kPoseDim, 1> deg_mask;
+  Eigen::Matrix<double, kPoseDim, 1> m_coefs;   // m_k = clip(w_k/tau_w, 0, 1)
+  std::vector<int> deg_indices, obs_indices;
+
+  // Projectors in the WHITENED coordinates (symmetric, orthonormal basis ũ).
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_obs_tilde, Pi_deg_tilde;
+  // The same projectors acting on ξ: S Π̃ S^{-1}. These are projectors
+  // ((SΠ̃S^{-1})² = SΠ̃S^{-1}) but NOT symmetric — they are self-adjoint with
+  // respect to the prior metric (P^-)^{-1}. The DD machinery in voxel_map.cpp
+  // currently assumes symmetric Π; consuming these requires either working in
+  // ξ̃ throughout or carrying the metric explicitly. Flagged, not papered over.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_obs_xi, Pi_deg_xi;
+
+  bool has_degeneracy() const { return !deg_indices.empty(); }
+  int deg_rank() const { return deg_indices.size(); }
+};
+
+// Whitened probe. `Lambda_L` = H^T R^-1 H (or Λ_L + Λ_V for the fused probe —
+// the whitening is a congruence on the fused information either way, and the
+// P1 inclusion argument is unchanged); `PriorCov` = P^-, the 6×6 prior pose
+// covariance from propagation (voxel_map.cpp: state_propagat.cov.block<6,6>).
+inline WhitenedResult probeWhitened(
+    const Eigen::Matrix<double, kPoseDim, kPoseDim>& Lambda_L,
+    const Eigen::Matrix<double, kPoseDim, kPoseDim>& PriorCov,
+    const WhitenedConfig& cfg) {
+  WhitenedResult r;
+  symSqrtAndInverse(PriorCov, cfg.prior_ev_floor, r.S, r.S_inv);
+
+  r.W = r.S * Lambda_L * r.S;
+  // Re-symmetrize: the congruence is symmetric in exact arithmetic; this only
+  // removes floating-point asymmetry so the eigensolver sees a symmetric input.
+  r.W = 0.5 * (r.W + r.W.transpose());
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, kPoseDim, kPoseDim>> es(r.W);
+  const Eigen::Matrix<double, kPoseDim, 1> evals = es.eigenvalues();       // ascending
+  const Eigen::Matrix<double, kPoseDim, kPoseDim> evecs = es.eigenvectors();
+  for (int i = 0; i < kPoseDim; ++i) {   // reverse to descending
+    r.w_vals(i)   = evals(kPoseDim - 1 - i);
+    r.w_vecs.col(i) = evecs.col(kPoseDim - 1 - i);
+  }
+
+  // Same single-threshold collapse as the raw probe, now in dimensionless
+  // units: (w_k < tau_w_abs) ∨ (w_k/w_1 < tau_w_rel) ⇔ w_k < max(tau_w_abs,
+  // tau_w_rel·w_1).
+  const double w1 = r.w_vals(0);
+  const double tau_w = std::max(cfg.tau_w_abs, cfg.tau_w_rel * std::max(w1, 1e-12));
+  r.tau_eff = tau_w;
+
+  r.deg_mask.resize(kPoseDim);
+  r.m_coefs.setZero();
+  for (int k = 0; k < kPoseDim; ++k) {
+    const double wk = r.w_vals(k);
+    const double mk_raw = std::min(1.0, std::max(0.0, wk / std::max(tau_w, 1e-12)));
+    const bool deg = cfg.hard_mask ? (mk_raw < 1.0) : (wk < tau_w);
+    r.deg_mask(k) = deg;
+    r.m_coefs(k)  = cfg.hard_mask ? (deg ? 0.0 : 1.0) : mk_raw;
+    if (deg) r.deg_indices.push_back(k);
+    else     r.obs_indices.push_back(k);
+    r.u_dirs.col(k) = r.S * r.w_vecs.col(k);
+  }
+
+  r.Pi_obs_tilde.setZero();
+  for (int k : r.obs_indices)
+    r.Pi_obs_tilde += r.w_vecs.col(k) * r.w_vecs.col(k).transpose();
+  r.Pi_deg_tilde =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity() - r.Pi_obs_tilde;
+  r.Pi_obs_xi = r.S * r.Pi_obs_tilde * r.S_inv;
+  r.Pi_deg_xi = r.S * r.Pi_deg_tilde * r.S_inv;
   return r;
 }
 
@@ -200,16 +499,26 @@ inline void assemblePrior(const PriorSource* src,
                           Eigen::Matrix<double, kPoseDim, 1>& b_pr) {
   Lambda_pr.setZero();
   b_pr.setZero();
-  if (!src || !res.has_degeneracy()) return;
-  for (int k : res.deg_indices) {
-    const PriorObservation po = src->priorForDirection(k, res);
-    if (!po.valid || po.info <= 0.0) continue;
-    const auto v_k = res.eigvecs.col(k);
-    Lambda_pr += po.info * (v_k * v_k.transpose());
-    b_pr += po.info * po.observation * v_k;
+  // NOTE: do NOT early-return when `src` is null. The default_prior_info
+  // floor below must be applied consistently in BOTH the mean path (here:
+  // Λ_eff / Htz_eff) and the covariance path (voxel_map.cpp Schur floor) —
+  // gating the floor on a wired PriorSource made the covariance use prior
+  // information the mean never saw (mean/covariance inconsistency).
+  if (!res.has_degeneracy()) return;
+  bool src_gave_any = false;
+  if (src) {
+    for (int k : res.deg_indices) {
+      const PriorObservation po = src->priorForDirection(k, res);
+      if (!po.valid || po.info <= 0.0) continue;
+      const auto v_k = res.eigvecs.col(k);
+      Lambda_pr += po.info * (v_k * v_k.transpose());
+      b_pr += po.info * po.observation * v_k;
+      src_gave_any = true;
+    }
   }
-  // Fallback default floor on degenerate directions if the source gave nothing.
-  if (cfg.default_prior_info > 0.0 && Lambda_pr.isZero()) {
+  // Fallback default floor on degenerate directions when no source is wired
+  // OR the source gave nothing on any degenerate direction.
+  if (cfg.default_prior_info > 0.0 && !src_gave_any) {
     for (int k : res.deg_indices) {
       const auto v_k = res.eigvecs.col(k);
       Lambda_pr += cfg.default_prior_info * (v_k * v_k.transpose());
@@ -265,6 +574,30 @@ struct ESIKFOutputs {
   Eigen::Matrix<double, kPoseDim, kPoseDim> Lambda_eff;
   Eigen::Matrix<double, kPoseDim, 1> Htz_eff;
   DegeneracyResult probe_res;  // for logging/diagnostics
+
+  // ---- Whitened mode: consumed by the caller when probe_res.tau_whitened ----
+  // In whitened mode `probe_res.M` is built in the ξ̃ directions ũ_k = S^{-1}u_k,
+  // so it is NOT the operator acting on ξ. The ξ-space mask operator is the
+  // SIMILARITY  M_ξ = S^{-1} M̃ S  (not the congruence S M̃ S — that is a
+  // different operator with a different spectrum, and it does not even have the
+  // right quadratic form). Numerically with a physically-scaled prior
+  // (σ_θ = 5e-4 rad, σ_p = 1e-2 m) and the 3 translational directions
+  // degenerate: eig(S M̃ S) = {0,0,0, 1e-4,1e-4,1e-4}, ‖S M̃ S‖ = 1.7e-4,
+  // while eig(S^{-1}M̃S) = {0,0,0, 1,1,1}, ‖S^{-1}M̃S‖ = 1.7, and only the
+  // latter reproduces vᵀΛ_eff v = ṽᵀW_eff ṽ. Λ_eff below is therefore built
+  // through the whitened space, not by masking Λ_L in place.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> M_xi =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  // WHITENED-coordinate (ξ̃) projectors — the well-conditioned pair. The
+  // covariance path uses these and converts the ξ-space prior covariance into
+  // ξ̃ with P̃ = S^{-1} P S^{-1} (inverse congruence), applies the standard
+  // theorem there, and converts back with P = S P̃ S. Both the projection and
+  // the congruence keep PSD, which is the point: operating on the ill-scaled
+  // ξ-space Π_ξ would not.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_obs_tilde =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Pi_deg_tilde =
+      Eigen::Matrix<double, kPoseDim, kPoseDim>::Zero();
 };
 
 inline ESIKFOutputs applyToESIKF(const ESIKFInputs& in,
@@ -285,8 +618,34 @@ inline ESIKFOutputs applyToESIKF(const ESIKFInputs& in,
   // Theorem 3 + T1: mask is applied to Λ_L only (visual ESIKF is separate).
   // On V_obs, M≈I => Λ_eff|V_obs = Λ_L|V_obs (LiDAR untouched, T1(i)).
   // On V_deg, M≈0 => Λ_eff|V_deg = Λ_pr (prior only, T1(ii)).
-  out.Lambda_eff = out.probe_res.M * in.Lambda_L * out.probe_res.M + Lambda_pr;
-  out.Htz_eff    = out.probe_res.M * in.Htz + b_pr;
+  //
+  // Whitened mode: `probe_res.M` lives in ξ̃, so route through the whitened
+  // space instead of masking Λ_L in place:
+  //     W = S Λ_L S,  W_eff = M̃ W M̃,  Λ_eff = S^{-1} W_eff S^{-1}
+  // which is exactly M_ξ Λ_L M_ξᵀ with M_ξ = S^{-1}M̃S. Λ_pr is assembled in ξ
+  // (assemblePrior uses probe_res.xi_dirs), so it is added AFTER the map back.
+  if (out.probe_res.tau_whitened) {
+    const auto& S    = out.probe_res.whiten_S;
+    const auto& Sinv = out.probe_res.whiten_S_inv;
+    const auto& Mt   = out.probe_res.M;
+    out.M_xi = Sinv * Mt * S;
+    const Eigen::Matrix<double, kPoseDim, kPoseDim> W =
+        0.5 * ((S * in.Lambda_L * S) + (S * in.Lambda_L * S).transpose());
+    const Eigen::Matrix<double, kPoseDim, kPoseDim> W_eff = Mt * W * Mt;
+    out.Lambda_eff = 0.5 * ((Sinv * W_eff * Sinv) +
+                            (Sinv * W_eff * Sinv).transpose()) + Lambda_pr;
+    // Residual information vector: the same map on the b side. b transforms
+    // like an information vector under ξ = S ξ̃, i.e. b_ξ = S^{-1} b_ξ̃, so the
+    // ξ-space masked residual is M_ξ (S^{-1} M̃ S) applied to Htz… which is
+    // M_ξ Htz only if Htz too is read in ξ, which it is. Keep the symmetric
+    // form: b_eff = M_ξ Htz + b_pr.
+    out.Htz_eff = out.M_xi * in.Htz + b_pr;
+    out.Pi_obs_tilde = out.probe_res.Pi_obs;
+    out.Pi_deg_tilde = out.probe_res.Pi_deg;
+  } else {
+    out.Lambda_eff = out.probe_res.M * in.Lambda_L * out.probe_res.M + Lambda_pr;
+    out.Htz_eff    = out.probe_res.M * in.Htz + b_pr;
+  }
   return out;
 }
 
