@@ -414,6 +414,117 @@ inline double updateAdaptiveNoise(AdaptiveNoiseState& s,
   return s.phi;
 }
 
+// ============================================================================
+// 9. RR-IESKF Axis II helpers (theory.tex sec:gate-optimal / sec:bias-read /
+//    sec:common-mode)
+// ============================================================================
+namespace rr_ieskf {
+
+// --- (a) Per-direction optimal gate (prop:gate-optimal, eq:gate-optimal) ---
+// The theory's gate is PER DIRECTION: w_{m,k}^2 λ_{m,k} with u_k^* =
+// min(1, 1/(2C b̂_k² λ_{m,k} − η_k)), η_k = λ_{m,k}/(λ_{m̄,k}+π_k). A scalar
+// gate on the whole Λ block over-suppresses healthy directions in mixed
+// scenes. This helper applies u_k per eigendirection of Λ_m:
+//   Λ_gated = Σ_k u_k² λ_k v_k v_k^T
+// (u_k=1 for all k reduces exactly to Λ_m). Cost: one 6×6 eigendecomposition.
+struct GateInputs {
+  Eigen::Matrix<double, kPoseDim, kPoseDim> Lambda;      // modality info Λ_m
+  Eigen::Matrix<double, kPoseDim, 1> u;                  // per-direction gates
+};
+inline Eigen::Matrix<double, kPoseDim, kPoseDim> gatePerDirection(
+    const GateInputs& in) {
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, kPoseDim, kPoseDim>> es(
+      in.Lambda);
+  // SelfAdjoint: ascending; u must follow the SAME order as eigenvalues.
+  Eigen::Matrix<double, kPoseDim, kPoseDim> V = es.eigenvectors();  // cols
+  Eigen::Matrix<double, kPoseDim, 1> lam = es.eigenvalues().cwiseMax(0.0);
+  Eigen::Matrix<double, kPoseDim, 1> lam_g = lam.cwiseProduct(in.u.cwiseProduct(in.u));
+  return V * lam_g.asDiagonal() * V.transpose();
+}
+
+// Per-direction information λ_k (of Λ_m) and the healthy-reference λ̄_k (of
+// Λ_ref), in Λ_m's OWN eigenbasis — the direction coordinate in which the
+// gate of prop:gate-optimal is defined (v_k fixed, both modalities report
+// along it).
+struct DirInfo {
+  Eigen::Matrix<double, kPoseDim, 1> lam;        // λ_{m,k}, ascending order
+  Eigen::Matrix<double, kPoseDim, 1> lam_ref;    // λ_{m̄,k} in the same basis
+};
+inline DirInfo directionInfos(const Eigen::Matrix<double, kPoseDim, kPoseDim>& Lambda_m,
+                              const Eigen::Matrix<double, kPoseDim, kPoseDim>& Lambda_ref) {
+  DirInfo d;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, kPoseDim, kPoseDim>> es(
+      Lambda_m);
+  d.lam = es.eigenvalues().cwiseMax(0.0);
+  const auto& V = es.eigenvectors();
+  d.lam_ref = (V.transpose() * Lambda_ref * V).diagonal().cwiseMax(0.0);
+  return d;
+}
+
+// --- (b) Differential bias read (prop:bias-read B3) ---
+// The differential read b̂^diff = r_L − r_V is unbiased for every λ and π
+// (measured worst rel err 3.4e-4) with Var = 1/λ_L + 1/λ_V, π-free, and ≥2×
+// the plug-in SNR everywhere. In-stream, per direction v_k of the fused
+// information, the projected difference of the two modalities' scalarized
+// NIS contributions is the implementable surrogate:
+//   diff_k := nu_L,k − nu_V,k
+// where nu_m,k is modality m's innovation energy projected on v_k. Under
+// per-modality bias the E|diff| shifts by the bias difference; under
+// COMMON-mode bias it stays at zero (prop:common-mode M2 — the read is
+// blind there, which is the desired selectivity). EMA per direction.
+struct DiffReadState {
+  Eigen::Matrix<double, kPoseDim, 1> ema =
+      Eigen::Matrix<double, kPoseDim, 1>::Zero();
+  bool initialized = false;
+};
+// Update from instantaneous projected NIS difference (ascending eigorder of
+// the fused probe's eigvecs — pass the same basis each frame).
+inline void updateDiffRead(DiffReadState& s,
+                           const Eigen::Matrix<double, kPoseDim, 1>& diff_inst,
+                           double alpha) {
+  if (!s.initialized) { s.ema = diff_inst; s.initialized = true; return; }
+  s.ema = (1.0 - alpha) * s.ema + alpha * diff_inst;
+}
+
+// --- (c) External anchor (prop:common-mode M4, eq:anchor-att) ---
+// The ONLY in-model defense against a steady common-mode bias: an unbiased
+// pseudo-observation r_A = e + n_A with information λ_A, applied on ALL
+// directions (not only the degenerate subspace — the common mode lives
+// everywhere), attenuating it by (λ_L+λ_V)/(λ_L+λ_V+λ_A). Implemented as a
+// PriorSource that assembles Λ_A = λ_A·I on the FULL 6-dim pose space with
+// observation b_A = λ_A·z_A (the anchor residual, e.g. zero-motion or
+// GNSS-style displacement).
+class AnchorPrior : public PriorSource {
+ public:
+  AnchorPrior(double info, const Eigen::Matrix<double, kPoseDim, 1>& obs)
+      : info_(info), obs_(obs) {}
+  PriorObservation priorForDirection(int /*k*/,
+                                     const DegeneracyResult& /*res*/) const override {
+    PriorObservation po;
+    po.valid = info_ > 0.0;
+    po.info = info_;
+    po.observation = obs_.mean();  // scalarized; see assembleAnchor below
+    return po;
+  }
+ private:
+  double info_;
+  Eigen::Matrix<double, kPoseDim, 1> obs_;
+};
+
+// Assemble the anchor's full-rank information directly (bypasses the
+// degenerate-subspace restriction of assemblePrior — the anchor must act on
+// ALL directions to fight the common mode). Returns Λ_A = λ_A·I and
+// b_A = λ_A·z_A.
+inline void assembleAnchor(double lambda_A,
+                           const Eigen::Matrix<double, kPoseDim, 1>& z_A,
+                           Eigen::Matrix<double, kPoseDim, kPoseDim>& Lambda_A,
+                           Eigen::Matrix<double, kPoseDim, 1>& b_A) {
+  Lambda_A = lambda_A * Eigen::Matrix<double, kPoseDim, kPoseDim>::Identity();
+  b_A = lambda_A * z_A;
+}
+
+}  // namespace rr_ieskf
+
 }  // namespace dd_esikf
 
 #endif  // DEGENERACY_H_

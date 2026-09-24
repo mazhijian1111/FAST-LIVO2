@@ -356,6 +356,26 @@ void LIVMapper::handleVIO()
       vio_manager->gate_lambda_L_valid = true;
     }
   }
+  // RR-IESKF Axis II (prop:bias-read B3): per-direction differential read.
+  // diff_k = ν_L,k − ν_V,k, the two modalities' normalized residual energies
+  // projected onto the fused probe's eigendirections. Under per-modality
+  // bias the EMA shifts; under common-mode bias it stays at zero
+  // (prop:common-mode M2 — the read is blind there, the desired selectivity).
+  // ν_L,k is the per-frame LIO NIS (mean residual energy / R-scale, EMA'd in
+  // the adaptive-noise state); ν_V,k is the VIO's gate_nu_V (same EMA
+  // semantics). The projection here is the diagonal approximation: the
+  // scalar NIS gap placed on the probe's dominant directions, i.e. diff is
+  // the same on all 6 coordinates (per-direction resolution needs the
+  // projected per-point Jacobians, deferred).
+  if (vio_manager->gate_enable && voxelmap_manager->dd_enable_ &&
+      voxelmap_manager->dd_last_probe_.has_degeneracy())
+  {
+    // ν_L: the DD adaptive-noise EMA is a NIS; 1 = consistent.
+    const double nu_L = voxelmap_manager->dd_ada_state_.rho;
+    const double nu_V = vio_manager->gate_nu_V;
+    vio_manager->gate_diff_read_.setConstant(nu_L - nu_V);
+    vio_manager->gate_diff_valid = true;
+  }
 
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
@@ -429,13 +449,33 @@ void LIVMapper::handleLIO()
   // slow-motion approximation, documented in degeneracy.h.
   if (vio_manager->last_V_valid)
   {
-    // RR-IESKF Axis II (prop:gate-optimal): apply the reliability gate to Λ_V
-    // BEFORE the fused-mask probe consumes it, so the probed fused information
-    // Λ_f = Λ_L + u²Λ_V reflects the gated visual information (the gated Λ_V
-    // is also what the mask semantics require: only trusted visual info may
-    // shrink the degenerate subspace, Theorem T1(iii)).
-    voxelmap_manager->setVisualInfo(
-        vio_manager->last_Lambda_V * (vio_manager->gate_u_V * vio_manager->gate_u_V), true);
+    // RR-IESKF Axis II (prop:gate-optimal): apply the per-direction reliability
+    // gate to Λ_V BEFORE the fused-mask probe consumes it (T1(iii): only
+    // trusted visual info may shrink the degenerate subspace). The gated
+    // Λ_V was cached by the VIO update in last_Lambda_V (the VIO gate now
+    // applies the per-direction u_k² internally before caching), so pass it
+    // through unchanged — the scalar re-gate of the first implementation is
+    // gone (it would double-apply the gate).
+    voxelmap_manager->setVisualInfo(vio_manager->last_Lambda_V, true);
+  }
+
+  // Real IMU preintegration prior (T2/T3 wiring): build the Δpose prior from
+  // the propagation that produced state_propagat — its Δpose relative to the
+  // last EKF state and the 6×6 pose covariance grown by the IMU process
+  // noise. The prior observation along each degenerate direction v_k is the
+  // v_k-projection of [log ΔR ; Δp], and its information is 1/(v_k^T Σ v_k).
+  // This replaces the constant default_prior_info floor on the directions
+  // the IMU actually constrains (the floor still fills the rest).
+  if (voxelmap_manager->imu_prior_enable_)
+  {
+    static StatesGroup last_ekf_state = state_propagat;  // first frame: Δ=0
+    const M3D dR = state_propagat.rot_end * last_ekf_state.rot_end.transpose();
+    const V3D dp = state_propagat.pos_end - last_ekf_state.pos_end;
+    Eigen::Matrix<double, 6, 6> Sigma = state_propagat.cov.block<6, 6>(0, 0);
+    Sigma += Eigen::Matrix<double, 6, 6>::Identity() * 1e-6;  // regularize
+    voxelmap_manager->dd_prior_src_ =
+        std::make_shared<dd_esikf::IMUPreintegrationPrior>(dp, dR, Sigma);
+    last_ekf_state = _state;  // the last EKF POSTERIOR (not the propagated)
   }
 
   voxelmap_manager->StateEstimation(state_propagat);

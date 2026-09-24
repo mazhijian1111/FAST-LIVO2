@@ -309,6 +309,21 @@ public:
     return v;
   }
   static double tilt_tau_global() { return s_tilt_tau(); }
+  // RR-IESKF external anchor (prop:common-mode M4 / eq:anchor-att).
+  // Full-rank pseudo-observation with information anchor_lambda_ on ALL pose
+  // directions; attenuates a steady common-mode bias by
+  // (λ_L+λ_V)/(λ_L+λ_V+λ_A). anchor_obs_ is the anchor residual (pose-error
+  // units, same value on all 6 dims by default — a differential anchor would
+  // fill the 6-vector per frame); z_A = 0 means pull toward the propagated
+  // pose.
+  bool   anchor_enable_ = false;
+  double anchor_lambda_ = 0.0;
+  double anchor_obs_    = 0.0;
+  Eigen::Matrix<double, 6, 1> anchor_z_A_ = Eigen::Matrix<double, 6, 1>::Zero();
+  // Real IMU preintegration prior (T2/T3): set in initDegeneracy, wired by
+  // LIVMapper each LIO frame. When false, the B3 constant floor
+  // (default_prior_info) is the only degenerate-subspace prior.
+  bool imu_prior_enable_ = false;
   // Optional file logger for per-frame degeneracy probe (Project A eval).
   std::string dd_log_file_;                          // empty => disabled
   std::ofstream dd_log_;                             // opened in initDegeneracy

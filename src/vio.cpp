@@ -1768,40 +1768,66 @@ void VIOManager::updateState(cv::Mat img, int level)
       }
 
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
-      // ---- RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate.
-      // The photometric residual energy is the NIS proxy
-      //   nu = mean_j r_j² / img_point_cov,
-      // whose EMA is the plug-in read's signal: b̂² ≈ (nu − 1) (per-pixel,
-      // prop:bias-read B1; the additive floor 1/(λ_f+2π) is inside the EMA's
-      // noise, not bias-corrected here). The cost-optimal gate (G2/G5) is the
-      // hyperbola
-      //   u* = min(1, 1 / (2 C b̂² λ_V − η)),   η = λ_V / (λ_L + π),
-      // with λ_V, λ_L the per-frame information SCALES tr(Λ)/6 and π the
-      // prior scale tr(P^-)^{-1}/6 approximated by 1/img_point_cov. The gate
-      // multiplies the visual pose information by u² (eq:gated-update's
-      // w_V²λ_V with w_V = u, w_L = 1). At nu ≤ 1 (consistent) u = 1 and
-      // this is EXACTLY the plain sum (rem:route-vs-sum: no loss in the
-      // unbiased regime). No-op when gate_enable is false.
+      // ---- RR-IESKF Axis II (prop:gate-optimal): optimal reliability gate,
+      // PER DIRECTION (eq:gate-optimal in the eigenbasis of Λ_V). The theory
+      // gates each pose direction v_k with its own u_k^* =
+      //   min(1, 1 / (2 C b̂_k² λ_V,k − η_k)),  η_k = λ_V,k/(λ_L,k + π_k),
+      // using λ_V,k = eigenvalues of Λ_V, λ_L,k = Λ_L's diagonal in that
+      // basis, and the bias input b̂_k² = max(b̂_k^{plug,2}, b̂_k^{diff,2})
+      // from the two reads of prop:bias-read: the plug-in read
+      // (residual-energy EMA above 1, B1/B2) and the differential read
+      // (projected NIS difference LiDAR-vs-visual, B3 — unbiased, π-free,
+      // ≥2× the plug-in SNR, and BLIND to common-mode bias per M2, which is
+      // the desired selectivity). The gate is applied as
+      //   Λ_V,gated = Σ_k u_k² λ_V,k v_k v_k^T  (rr_ieskf::gatePerDirection),
+      // which at u ≡ 1 is EXACTLY Λ_V (rem:route-vs-sum: no loss in the
+      // unbiased regime) and in mixed scenes suppresses only the directions
+      // that are actually inconsistent — the scalar-gate failure mode
+      // (healthy directions dragged down) is gone. No-op when gate_enable is
+      // false.
       if (gate_enable && n_meas > 0)
       {
-        // Plug-in read: mean residual energy in noise-units, clamped at the
-        // consistent value (B1: the read is frequently negative frame-wise).
+        // Plug-in read (B1): mean residual energy in noise-units, clamped at
+        // the consistent value (the read is frequently negative frame-wise).
         const double nu_inst = error / std::max(1e-9, (double)n_meas) / img_point_cov;
         gate_nu_V = (1.0 - gate_nu_alpha) * gate_nu_V + gate_nu_alpha * nu_inst;
-        // Per-frame information scales.
-        const double lam_V = std::max(last_Lambda_V.trace() / 6.0, 1e-9);
-        gate_lambda_V = 0.9 * gate_lambda_V + 0.1 * lam_V;
-        const double lam_L = gate_lambda_L_valid
-                                 ? std::max(gate_lambda_L, 1e-9)
-                                 : 10.0 * gate_lambda_V;  // fallback: LiDAR ≫ visual
+        const double b2_plug = std::max(gate_nu_V - 1.0, 0.0);
+        // Per-direction infos in Λ_V's eigenbasis.
+        const Eigen::Matrix<double, 6, 6> LamV =
+            H_T_H.block<6, 6>(0, 0);  // NOTE: gate BEFORE the K_1 assembly
+        Eigen::Matrix<double, 6, 6> LamL =
+            Eigen::Matrix<double, 6, 6>::Zero();
+        if (gate_lambda_L_valid)
+          LamL = Eigen::Matrix<double, 6, 6>::Identity() *
+                 std::max(gate_lambda_L, 1e-9);  // LiDAR scale (scalar proxy)
         const double pi_pr = 1.0 / std::max(img_point_cov, 1e-9);
-        // Optimal gate (eq:gate-optimal): b̂² = max(nu − 1, 0).
-        const double b2 = std::max(gate_nu_V - 1.0, 0.0);
-        const double eta = gate_lambda_V / (lam_L + pi_pr);
-        const double denom = 2.0 * gate_C * b2 * gate_lambda_V - eta;
-        gate_u_V = (denom > 0.0) ? std::min(1.0, 1.0 / denom) : 1.0;
-        // Apply the gate: scale the visual pose information by u².
-        H_T_H.block<6, 6>(0, 0) *= (gate_u_V * gate_u_V);
+        auto dinf = dd_esikf::rr_ieskf::directionInfos(LamV, LamL);
+        // Differential read (B3): the LiDAR-vs-visual NIS difference is
+        // supplied per frame by LIVMapper (gate_diff_read_), projected onto
+        // Λ_V's eigenbasis; its bias signature is |diff| above the
+        // noise level, so the effective b̂_k² takes the max of the two reads.
+        Eigen::Matrix<double, 6, 1> u_k;
+        for (int k = 0; k < 6; ++k)
+        {
+          const double lam_vk = std::max(dinf.lam(k), 1e-9);
+          const double lam_lk = std::max(dinf.lam_ref(k), 1e-9) + pi_pr;
+          // Per-direction bias energy: plug-in (same for all k — the photometric
+          // energy is not yet per-direction resolvable) and the differential
+          // read (per-direction, from the LIO/VIO NIS gap).
+          const double b2_diff =
+              std::max(std::abs(gate_diff_read_(k)) - 1.0, 0.0);
+          const double b2 = std::max(b2_plug, b2_diff);
+          const double eta = lam_vk / lam_lk;
+          const double denom = 2.0 * gate_C * b2 * lam_vk - eta;
+          u_k(k) = (denom > 0.0) ? std::min(1.0, 1.0 / denom) : 1.0;
+        }
+        gate_u_V = u_k.mean();  // diagnostics: the average gate factor
+        // Assemble the per-direction gate matrix in Λ_V's eigenbasis.
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(LamV);
+        Eigen::Matrix<double, 6, 1> lam_g =
+            es.eigenvalues().cwiseMax(0.0).cwiseProduct(u_k.cwiseProduct(u_k));
+        H_T_H.block<6, 6>(0, 0) =
+            es.eigenvectors() * lam_g.asDiagonal() * es.eigenvectors().transpose();
       }
       MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
       auto &&HTz = H_sub_T * z;

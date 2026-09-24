@@ -177,6 +177,13 @@ public:
   double gate_lambda_V = 1.0;     // scale of Λ_V: tr(Λ_V)/6, EMA-smoothed
   double gate_lambda_L = 1.0;     // scale of Λ_L from LIO: tr(Λ_L)/6 (set by LIVMapper)
   bool   gate_lambda_L_valid = false;
+  // Per-direction differential bias read (prop:bias-read B3): the LiDAR-vs-
+  // visual NIS difference, updated per frame by LIVMapper and consumed by
+  // the per-direction gate. Blind to common-mode bias (prop:common-mode M2)
+  // — the desired selectivity.
+  Eigen::Matrix<double, 6, 1> gate_diff_read_ =
+      Eigen::Matrix<double, 6, 1>::Zero();
+  bool   gate_diff_valid = false;
 
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;

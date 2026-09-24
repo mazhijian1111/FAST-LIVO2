@@ -86,6 +86,24 @@ void VoxelMapManager::initDegeneracy(ros::NodeHandle &nh)
   // information threshold).
   nh.param<double>("dd_esikf/tilt_tau",        tilt_tau_,                  0.0);
   s_tilt_tau() = tilt_tau_;  // relay to VoxelOctoTree::init_plane (static)
+  // RR-IESKF external anchor (prop:common-mode M4 / eq:anchor-att): the only
+  // in-model defense against a steady common-mode (extrinsic) bias. Adds a
+  // full-rank pseudo-observation with information anchor_lambda on ALL pose
+  // directions; attenuates the common-mode bias by
+  // (λ_L+λ_V)/(λ_L+λ_V+λ_A). anchor_obs is the anchor residual in pose-error
+  // units (default 0 = pull toward the propagated pose — a zero-motion/
+  // motion-prior anchor; a GNSS-style displacement would be set per frame).
+  nh.param<bool>  ("dd_esikf/anchor_enable",   anchor_enable_,             false);
+  nh.param<double>("dd_esikf/anchor_lambda",   anchor_lambda_,             0.0);
+  nh.param<double>("dd_esikf/anchor_obs",      anchor_obs_,                0.0);
+  anchor_z_A_.setConstant(anchor_obs_);  // scalar obs on all 6 dims by default
+  // ---- Real IMU preintegration prior (Project A / Theorem T2-T3 wiring):
+  // when imu_prior_enable is true, LIVMapper wires dd_prior_src_ to an
+  // IMUPreintegrationPrior built from the propagated Δpose and its
+  // covariance; the constant default_prior_info floor then only fills the
+  // directions the IMU prior does not cover. The wiring itself is in
+  // LIVMapper::handleLIO (it owns the IMU handle). ----
+  nh.param<bool>  ("dd_esikf/imu_prior_enable", imu_prior_enable_,        false);
   // dd_prior_src_ is wired by LIVMapper (which owns the IMU/visual state),
   // not here, since VoxelMapManager has no direct IMU preintegration handle.
 
@@ -578,6 +596,15 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     VectorXd HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    // ---- RR-IESKF Axis I: capture the FRESH (this-iterate) pose quantities
+    // BEFORE the FEJ / DD substitution blocks below overwrite them with the
+    // iter-0 caches. lem:dfej composes Λ_eff = Π_obs Λ^(i) Π_obs + Π_deg
+    // Λ^(0)_eff Π_deg — the Π_obs term MUST be the re-linearized Λ^(i) of the
+    // moving iterate. Reading H_T_H after the substitutions (they run every
+    // inner iteration) would feed the frozen values into the observable block
+    // and silently degrade DFEJ to whole-frame FEJ (thm:fej-obias). ----
+    const Eigen::Matrix<double, 6, 6> Lambda_iter = H_T_H.block<6, 6>(0, 0);
+    const Eigen::Matrix<double, 6, 1> HTz_iter    = HTz.head<6>();
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
 
     // ---- Layer 4 (Theorem T4): first-estimate Jacobian (FEJ) on the pose
@@ -662,9 +689,12 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     {
       const Eigen::Matrix<double, 6, 6>& Pi_obs = dd_last_probe_.Pi_obs;
       const Eigen::Matrix<double, 6, 6>& Pi_deg = dd_last_probe_.Pi_deg;
-      // Fresh (this-iterate) pose quantities, after FEJ/DD substitution above.
-      Eigen::Matrix<double, 6, 6> Lambda_fresh = H_T_H.block<6, 6>(0, 0);
-      Eigen::Matrix<double, 6, 1> HTz_fresh    = HTz.head<6>();
+      // Fresh (this-iterate) pose quantities — captured BEFORE the FEJ/DD
+      // substitution blocks above (Lambda_iter/HTz_iter), NOT the cached
+      // values now sitting in H_T_H. This is exactly the Π_obs Λ^(i) Π_obs
+      // term of lem:dfej: re-linearized information on O, frozen on D.
+      const Eigen::Matrix<double, 6, 6>& Lambda_fresh = Lambda_iter;
+      const Eigen::Matrix<double, 6, 1>& HTz_fresh    = HTz_iter;
       // Frozen first-estimate effective quantities.
       Eigen::Matrix<double, 6, 6> Lambda_frozen = fej_enable_
           ? dd_Lambda_eff_cached_          // FEJ ran: cache is the frozen effective Λ
@@ -676,6 +706,35 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       HTz.head<6>() = Pi_obs * HTz_fresh + Pi_deg * HTz_frozen;
     }
     // ---- end DFEJ -------------------------------------------------------
+
+    // ---- RR-IESKF Axis II (prop:common-mode M4, eq:anchor-att): external
+    // anchor prior. The anchor is the ONLY in-model defense against a steady
+    // common-mode (extrinsic) bias (M2: every in-stream statistic is blind;
+    // M5: the gate is structurally inert). It enters as a full-rank
+    // pseudo-observation with information λ_A on ALL directions (not only the
+    // degenerate subspace — the common mode lives everywhere), attenuating
+    // the absorbed bias by exactly (λ_L+λ_V)/(λ_L+λ_V+λ_A). Assembled once
+    // per frame at iter 0 (same iterate-independence contract as the DD
+    // mask), added to Λ_eff / Htz_eff. Zero-velocity / GNSS-style sources
+    // supply z_A; z_A = 0 (pull to the propagated pose) is the default and
+    // is what a "motion prior" anchor means here. No-op when
+    // anchor_lambda_ <= 0.
+    if (anchor_enable_ && dd_enable_ && iterCount == 0 &&
+        anchor_lambda_ > 0.0)
+    {
+      Eigen::Matrix<double, 6, 6> Lambda_A;
+      Eigen::Matrix<double, 6, 1> b_A;
+      dd_esikf::rr_ieskf::assembleAnchor(anchor_lambda_, anchor_z_A_,
+                                         Lambda_A, b_A);
+      dd_Lambda_eff_cached_ += Lambda_A;
+      dd_Htz_eff_cached_    += b_A;
+      if (fej_enable_)  // keep FEJ's frozen cache consistent with the anchor
+      {
+        dd_Lambda_L_cached_ += Lambda_A;
+        dd_Htz_cached_      += b_A;
+      }
+    }
+    // ---- end anchor ------------------------------------------------------
 
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);

@@ -30,6 +30,11 @@
 	     dfej takes precedence over fej when both are true (and dd_enable=true). -->
 	<arg name="fej_enable" default="" />
 	<arg name="dfej_enable" default="" />
+	<!-- RR-IESKF Axis I extras: real IMU prior and external anchor (M4).
+	     Toggled from the research sweep without editing dd_esikf.yaml. -->
+	<arg name="imu_prior_enable" default="" />
+	<arg name="anchor_enable" default="" />
+	<arg name="anchor_lambda" default="" />
 
 	<param name="use_sim_time" value="true" />
 
@@ -66,6 +71,9 @@
 	<param name="dd_esikf/log_file"            value="$(arg dd_log_file)" />
 	<param if="$(eval fej_enable != '')" name="dd_esikf/fej_enable"    value="$(arg fej_enable)" />
 	<param if="$(eval dfej_enable != '')" name="dd_esikf/dfej_enable"  value="$(arg dfej_enable)" />
+	<param if="$(eval imu_prior_enable != '')" name="dd_esikf/imu_prior_enable" value="$(arg imu_prior_enable)" />
+	<param if="$(eval anchor_enable != '')" name="dd_esikf/anchor_enable"       value="$(arg anchor_enable)" />
+	<param if="$(eval anchor_lambda != '')" name="dd_esikf/anchor_lambda"       value="$(arg anchor_lambda)" />
 
 	<!-- The bag stores the RGB stream as sensor_msgs/CompressedImage. -->
 	<node pkg="image_transport" type="republish" name="outdoor04_image_decompress"

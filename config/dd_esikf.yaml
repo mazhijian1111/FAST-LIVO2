@@ -116,7 +116,7 @@ dd_esikf:
   # P4 covariance projection, which runs in the same update. When BOTH
   # fej_enable and dfej_enable are true, DFEJ takes precedence: the O-block
   # stays fresh while the D-block is frozen by the DD cache.
-  dfej_enable: false
+  dfej_enable: true
 
   # ---------------------------------------------------------------------------
   # RR-IESKF freeze threshold (theory.tex thm:residual / cor:tilt-resolution).
@@ -128,6 +128,30 @@ dd_esikf:
   #         (θ²_tilt = ⟨λ_min/λ_mid⟩_w ~ σ_pt/(L·√w)) rather than whether the
   #         information is numerically small (rem:which-floor).
   tilt_tau: 0.0
+
+  # ---------------------------------------------------------------------------
+  # RR-IESKF external anchor (theory.tex sec:common-mode, prop:common-mode
+  # M4 / eq:anchor-att). The ONLY in-model defense against a steady
+  # common-mode (extrinsic) bias: a full-rank pseudo-observation with
+  # information anchor_lambda on ALL pose directions (not only the degenerate
+  # subspace — the common mode lives everywhere), attenuating the absorbed
+  # bias by exactly (λ_L+λ_V)/(λ_L+λ_V+λ_A). anchor_obs is the anchor
+  # residual in pose-error units (0 = pull toward the propagated pose, i.e.
+  # a motion-prior anchor). Sizing (M4): to hold the common-mode bias below
+  # ε needs anchor_lambda ≥ (λ_L+λ_V)(1/ε − 1). No-op when lambda = 0.
+  anchor_enable: false
+  anchor_lambda: 0.0
+  anchor_obs: 0.0
+
+  # ---------------------------------------------------------------------------
+  # Real IMU preintegration prior (Theorems T2/T3 wiring). When true,
+  # LIVMapper builds an IMUPreintegrationPrior from the propagated Δpose and
+  # its 6×6 covariance each LIO frame; the prior observation along each
+  # degenerate direction is the v_k-projection of [log ΔR ; Δp] and its
+  # information is 1/(v_k^T Σ v_k). Replaces the constant default_prior_info
+  # floor on the directions the IMU actually constrains (the floor still
+  # fills the rest). imu_prior_enable requires enable: true.
+  imu_prior_enable: false
 
   # ---------------------------------------------------------------------------
   # RR-IESKF Axis II (theory.tex sec:gate-optimal / prop:gate-optimal):
